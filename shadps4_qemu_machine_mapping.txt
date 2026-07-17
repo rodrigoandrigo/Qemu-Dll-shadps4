@@ -1,0 +1,4272 @@
+MAPEAMENTO DO SHADPS4 PARA UMA MAQUINA QEMU X86_64 DEDICADA
+======================================================================
+
+Data da analise: 2026-07-13
+
+Arvore analisada:
+  C:\Users\user1\Projetos\shadPS4
+
+Arvore de destino planejada:
+  C:\Users\user1\qemu-11
+
+Escopo deste documento:
+  - Mapear os componentes do shadPS4 que representam comportamento da
+    maquina, sistema operacional, GPU, audio, input e servicos.
+  - Indicar onde cada comportamento esta implementado no shadPS4.
+  - Indicar como cada componente deve ser tratado em um novo target QEMU.
+  - Identificar lacunas que impedem uma emulacao completa de hardware.
+  - Definir uma ordem de implementacao e criterios de validacao.
+
+Fora do escopo:
+  - Nenhum codigo foi portado ou alterado.
+  - Nenhum arquivo do shadPS4 foi modificado.
+  - Este documento nao afirma que o shadPS4 contenha uma descricao completa
+    do hardware real.
+
+
+1. CONCLUSAO PRINCIPAL
+======================================================================
+
+O shadPS4 atual nao e um emulador de placa-mae PS4 completa. Ele e
+predominantemente um emulador HLE:
+
+  - carrega eboot.bin/ELF diretamente no processo host;
+  - mapeia o espaco virtual do processo Orbis no processo host;
+  - executa codigo x86_64 do jogo diretamente quando o host e x86_64;
+  - substitui imports de bibliotecas do sistema por funcoes HLE;
+  - implementa threads do guest sobre threads nativas;
+  - converte excecoes/sinais do host em comportamento esperado pelo guest;
+  - interpreta comandos AMD GCN/Liverpool e os traduz para Vulkan;
+  - implementa VideoOut, AudioOut, Pad, filesystem e rede em nivel de API.
+
+Consequencia para o QEMU:
+
+Nao basta criar uma MachineClass, ligar oito CPUs x86_64 e copiar os fontes
+da GPU. O novo target precisa escolher formalmente um dos modelos abaixo.
+
+Modelo A - full-system real:
+  Inicializa firmware/kernel Orbis e emula registradores, PCI/MMIO, DMA,
+  interrupcoes e dispositivos reais. O shadPS4 nao fornece informacao
+  suficiente para isso. Seriam necessarios dumps permitidos, documentacao,
+  traces e engenharia reversa adicional.
+
+Modelo B - maquina hibrida HLE, recomendado para aproveitar o shadPS4:
+  Usa o backend x86_64 do QEMU, mas adiciona um carregador e runtime HLE para
+  executar aplicacoes Orbis sem inicializar o firmware completo. GPU, audio,
+  input, filesystem e bibliotecas continuam em nivel alto. Este modelo e o
+  mais proximo da arquitetura existente do shadPS4.
+
+Modelo C - incorporar o runtime shadPS4 quase inteiro:
+  A DLL QEMU apenas hospeda o runtime shadPS4. E o caminho mais rapido para
+  compatibilidade inicial, mas cria dois loops, dois gerenciadores de memoria,
+  dois modelos de thread e forte dependencia de SDL/Vulkan/Win32. Nao e uma
+  boa arquitetura final para UWP.
+
+Recomendacao:
+  Criar um target de build dedicado e uma MachineClass dedicada, mas definir
+  a primeira versao como uma maquina hibrida HLE. Nao prometer boot de firmware
+  ou fidelidade de placa-mae enquanto os dispositivos reais nao existirem.
+
+DECISAO DO PROJETO:
+  O modelo selecionado e o Modelo B - maquina hibrida HLE.
+
+Esta decisao fixa o seguinte contrato para o novo target:
+  - o boot inicial carrega diretamente eboot.bin/SELF/ELF;
+  - nao existe boot de BIOS, UEFI ou kernel Orbis real na primeira versao;
+  - CPU e memoria pertencem ao modelo QEMU;
+  - loader, linker, processos, threads, TLS, equeue e bibliotecas Orbis sao HLE;
+  - Liverpool/PM4 e adaptado em nivel alto, com renderer desacoplado;
+  - VideoOut, AudioOut, Pad, filesystem e rede permanecem servicos HLE;
+  - a MachineClass coordena lifecycle e ownership, mas nao finge dispositivos
+    low-level para os quais nao existe especificacao;
+  - uma eventual maquina full-system sera uma evolucao separada e nao deve
+    contaminar as interfaces do runtime hibrido.
+
+
+2. IDENTIDADE DO NOVO TARGET
+======================================================================
+
+Nome provisoriamente usado neste documento:
+  x86_64-shadps4-softmmu
+
+O nome definitivo deve ser decidido antes de criar arquivos. Ele deve:
+  - comecar por x86_64 para preservar suposicoes do configure;
+  - terminar exatamente em -softmmu;
+  - nao ser compilado junto com x86_64-softmmu enquanto ambos produzirem o
+    mesmo nome de DLL;
+  - ter um nome de saida dedicado, por exemplo qemu-system-shadps4.dll.
+
+Arquivos de build que seriam necessarios no QEMU:
+  configs/targets/x86_64-shadps4-softmmu.mak
+  configs/devices/x86_64-shadps4-softmmu/default.mak
+  hw/i386/Kconfig
+  hw/i386/meson.build
+  hw/i386/shadps4-machine.c ou um novo subdiretorio hw/i386/shadps4/
+  meson.build, para nome de saida dedicado se TARGET_NAME nao for alterado
+
+Configuracao de arquitetura esperada:
+  TARGET_ARCH=x86_64
+  TARGET_BASE_ARCH=i386
+  TARGET_LONG_BITS=64
+
+O target deve reutilizar:
+  - target/i386 para CPU e TCG;
+  - APIC/IOAPIC e infraestrutura x86 somente quando exigidos pelo modelo;
+  - sistema de memoria, timers e runstate do QEMU;
+  - API qemu_host_* ja adicionada para embedding;
+  - display host, XAudio2 e input host ja adicionados ao QEMU.
+
+Nao deve herdar automaticamente todas as placas PC:
+  CONFIG_I440FX=n
+  CONFIG_Q35=n
+  CONFIG_ISAPC=n
+  CONFIG_MICROVM=n
+  CONFIG_NITRO_ENCLAVE=n
+
+A nova maquina deve ter um simbolo Kconfig proprio e selecionar apenas as
+dependencias realmente usadas.
+
+
+3. FLUXO DE INICIALIZACAO OBSERVADO NO SHADPS4
+======================================================================
+
+Fonte principal:
+  src/emulator.cpp, Emulator::Run(), aproximadamente linhas 191-534.
+
+Sequencia observada:
+  1. Define a thread principal do emulador.
+  2. Resolve o caminho do eboot.bin.
+  3. Monta a pasta do jogo em /app0 e /hostapp.
+  4. Le sce_sys/param.sfo e extrai titulo, firmware, SDK e atributos.
+  5. Carrega configuracao global e configuracao por jogo.
+  6. Cria stdin, stdout e stderr virtuais.
+  7. Inicializa MemoryManager, GameControllers e Linker.
+  8. Inicializa RenderDoc opcionalmente.
+  9. Prepara trofeus, dados, temporarios, downloads, capturas e fontes.
+ 10. Registra todas as bibliotecas HLE.
+ 11. Carrega o eboot.bin com o linker interno.
+ 12. Reloca imports e carrega modulos adicionais.
+ 13. Prepara memoria direta/flexivel e TLS.
+ 14. Cria a thread principal do jogo.
+ 15. Salta diretamente para o entry point x86_64 do jogo.
+ 16. Mantem o frontend em um loop SDL ate a janela fechar.
+ 17. Encerra com std::quick_exit().
+
+Mapeamento para o QEMU:
+  - Os passos 2-15 precisam formar um subsistema de boot HLE da maquina.
+  - O loop SDL nao deve ser portado para a DLL UWP.
+  - O loop deve ser controlado por qemu_host_main_loop_step() ou pela thread
+    interna controlada pela API de embedding.
+  - std::quick_exit(), exit(), abort() e encerramento do processo devem ser
+    substituidos por erros, request_shutdown e callbacks de log/estado.
+  - A maquina deve suportar init, realize, reset, shutdown e cleanup repetiveis.
+
+
+4. CPU E EXECUCAO X86_64
+======================================================================
+
+Fontes relevantes no shadPS4:
+  src/core/linker.cpp
+  src/core/cpu_patches.cpp
+  src/core/thread.cpp
+  src/core/signals.cpp
+  src/core/tls.cpp
+  src/common/arch.h
+  src/common/signal_context.h
+
+Comportamento observado:
+  - RunMainEntry salta diretamente para o entry point do ELF usando ABI PS4.
+  - A execucao direta so esta implementada para host ARCH_X86_64.
+  - O stack inicial e montado manualmente.
+  - TLS do guest e adaptado para TLS do host.
+  - Acesso FS:[0] e stack canary recebem patches dinamicos.
+  - Instrucoes AMD SSE4a, como EXTRQ/INSERTQ, podem ser reescritas quando o
+    host nao as suporta.
+  - MXCSR e FPUCW sao ajustados para valores esperados pelo Orbis.
+  - Excecoes Windows e sinais POSIX sao usados para falhas de memoria,
+    instrucoes ilegais e sinais do guest.
+
+O que deve ser feito no QEMU:
+  - Definir se o codigo do jogo sera executado pelo TCG ou nativamente.
+  - Para UWP/Xbox e portabilidade, TCG e o caminho mais consistente.
+  - Se TCG for usado, os patches Xbyak/Zydis do shadPS4 nao devem ser copiados
+    como mecanismo principal. TLS, FS/GS, SSE4a, CPUID e excecoes devem ser
+    modelados pelo backend x86 do QEMU.
+  - Definir um modelo de CPU compativel com o conjunto de instrucoes esperado
+    pelos jogos. Nao anunciar recursos nao implementados.
+  - Definir topologia, quantidade de vCPUs e frequencias como propriedades da
+    maquina, sem fixar valores antes de validar o hardware alvo.
+  - Implementar a preparacao do stack de processo e ABI PS4 no carregador HLE,
+    nao no reset vetorial de uma placa PC.
+  - Se houver modo nativo opcional, ele deve ser uma aceleracao separada e nao
+    alterar o contrato da maquina.
+
+Risco principal:
+  O shadPS4 depende de o endereco virtual do guest existir no processo host.
+  O TCG usa memoria de guest controlada pelo QEMU. Ponteiros de guest nao podem
+  ser tratados diretamente como ponteiros host. Toda funcao HLE precisara de
+  helpers seguros para leitura, escrita, strings, iovec e estruturas do guest.
+
+
+5. MEMORIA FISICA E ESPACO VIRTUAL
+======================================================================
+
+Fontes relevantes no shadPS4:
+  src/core/memory.cpp
+  src/core/memory.h
+  src/core/address_space.cpp
+  src/core/address_space.h
+  src/core/libraries/kernel/memory.cpp
+  src/core/libraries/kernel/memory.h
+
+Valores observados no codigo:
+  - memoria disponivel base: 5248 MB;
+  - memoria disponivel Pro/Neo: 5888 MB;
+  - memoria DevKit: 6656 MB;
+  - memoria DevKit Pro: 7936 MB, marcada no codigo como valor a confirmar;
+  - flexible memory base: 64 MB;
+  - flexible memory size inicial: 512 MB;
+  - GPU aceita enderecos abaixo de 40 bits;
+  - system managed: 0x00400000 ate 0x7ffffbfff;
+  - system reserved: 0x7ffffc000 ate 0xfffffffff em hosts comuns;
+  - user virtual inicia em 0x1000000000 em hosts comuns;
+  - limites do user virtual variam por sistema host no shadPS4.
+
+Conceitos implementados:
+  - direct memory;
+  - flexible memory;
+  - pooled memory;
+  - memoria fisica com aliases;
+  - protecoes CPU e GPU;
+  - mapeamento anonimo e de arquivo;
+  - areas code, stack, system, file e reserved;
+  - notificacao ao rasterizer quando memoria compartilhada muda.
+
+O que deve ser feito no QEMU:
+  - Criar uma regiao RAM da maquina com tamanho configuravel por modo.
+  - Separar guest physical address de guest virtual address.
+  - Representar direct/flexible memory como politica do kernel HLE, sobre a
+    RAM da maquina, em vez de reservar diretamente o espaco virtual host.
+  - Criar uma API de traducao guest virtual -> guest physical -> host pointer
+    com verificacao de tamanho, overflow, permissao e pagina.
+  - Definir como aliases de direct memory aparecem para CPU e GPU.
+  - Integrar dirty tracking para GPU, display e possiveis snapshots.
+  - Preservar alinhamentos de 16 KB e 64 KB onde as APIs Orbis exigirem.
+  - Validar os mapas base, Pro e DevKit separadamente.
+  - Nao copiar os limites condicionais de Linux/macOS/FreeBSD: eles sao
+    restricoes do processo host do shadPS4, nao necessariamente do guest.
+
+
+6. LOADER, SELF/ELF, MODULOS E LINKER
+======================================================================
+
+Fontes relevantes no shadPS4:
+  src/core/loader/elf.cpp
+  src/core/loader/elf.h
+  src/core/loader/dwarf.cpp
+  src/core/module.cpp
+  src/core/module.h
+  src/core/linker.cpp
+  src/core/linker.h
+  src/core/loader/symbols_resolver.cpp
+  src/core/aerolib/
+
+Comportamento observado:
+  - carrega eboot.bin e modulos SPRX;
+  - trata SELF/ELF e program headers;
+  - mapeia segmentos no espaco virtual;
+  - resolve imports por NID;
+  - suporta exports de modulos carregados;
+  - aplica relocacoes;
+  - constroi TLS estatico e dinamico;
+  - pode usar libSceLibcInternal LLE se o arquivo estiver disponivel;
+  - caso contrario registra libc HLE;
+  - executa entry points de modulos e do jogo.
+
+O que deve ser feito no QEMU:
+  - Portar o parser de formato como modulo independente do frontend.
+  - Substituir memcpy/ponteiros diretos por acessos ao AddressSpace do QEMU.
+  - Separar parsing, validacao, alocacao, relocacao e execucao.
+  - Reportar erros ao host sem quick_exit.
+  - Definir uma propriedade da maquina para o caminho do eboot.
+  - Definir propriedades para sysmodules, game root, patches e argumentos.
+  - Nao incorporar chaves, firmware ou conteudo protegido na DLL.
+  - Preservar validacoes de limites antes de confiar em headers do guest.
+  - Definir ownership e cleanup de todos os modulos para permitir restart.
+
+
+7. KERNEL E BIBLIOTECAS HLE
+======================================================================
+
+Registro central:
+  src/core/libraries/libs.cpp, InitHLELibs().
+
+Grupos observados:
+  - kernel, processo, memoria, threads, sincronizacao, tempo e equeue;
+  - libc interna e POSIX;
+  - GnmDriver e VideoOut;
+  - AudioOut, AudioIn, Audio3D, AJM e NGS2;
+  - Pad, Mouse, Move, Camera, HMD e VR tracker;
+  - filesystem, save data, app content, playgo e disc map;
+  - rede, HTTP, SSL, NP e shadnet;
+  - dialogs, IME, font, screenshot e system services;
+  - decodificacao de imagem, video, avplayer e compactacao;
+  - trofeus, usuarios, convite, remote play e share play;
+  - varias bibliotecas ainda possuem funcoes stub.
+
+O que deve ser feito no QEMU:
+  - Nao registrar todas as bibliotecas dentro de MachineClass::init.
+  - Criar um runtime HLE pertencente a uma instancia da maquina.
+  - Remover singletons globais ou encapsula-los por instancia.
+  - Definir uma tabela de modulos HLE com init, reset e shutdown.
+  - Cada chamada HLE deve receber um contexto de processo/maquina.
+  - Converter argumentos de ponteiro usando helpers de memoria guest.
+  - Impedir que callbacks HLE chamem APIs de UI diretamente.
+  - Manter uma lista de stubs e telemetria de chamadas nao implementadas.
+  - Priorizar bibliotecas necessarias para o primeiro executavel de teste.
+
+Limite arquitetural:
+  Bibliotecas HLE nao sao dispositivos QEMU. Elas pertencem ao runtime de
+  sistema operacional da maquina hibrida. Mistura-las com MMIO ou DeviceState
+  dificultaria reset, testes e uma futura implementacao full-system.
+
+
+8. THREADS, TLS, SINCRONIZACAO E SINAIS
+======================================================================
+
+Fontes relevantes no shadPS4:
+  src/core/thread.cpp
+  src/core/thread.h
+  src/core/tls.cpp
+  src/core/signals.cpp
+  src/core/libraries/kernel/threads/
+  src/core/libraries/kernel/sync/
+  src/core/libraries/kernel/equeue.cpp
+
+Comportamento observado:
+  - uma thread guest e normalmente uma thread host;
+  - usa CreateThread/ExitThread no Windows;
+  - usa pthread e signal stack em POSIX;
+  - mutexes, condvars, semaforos e rwlocks sao HLE;
+  - equeue entrega eventos de timer, user, video e GPU;
+  - TLS e TCB sao construidos pelo linker/runtime.
+
+O que deve ser feito no QEMU:
+  - Definir se threads guest serao vCPUs, tarefas HLE ou uma combinacao.
+  - Nao criar CreateThread diretamente em codigo UWP.
+  - Integrar espera e wakeup ao AioContext/BQL sem bloquear o loop principal.
+  - Tornar equeue independente de handles Win32/POSIX.
+  - Garantir que shutdown acorde todas as esperas.
+  - Implementar cancelamento e join deterministas.
+  - Mapear excecoes de CPU do TCG para sinais/excecoes Orbis no runtime HLE.
+  - Testar TLS de thread principal, threads secundarias e modulos dinamicos.
+
+
+9. INTERRUPCOES E EVENTOS
+======================================================================
+
+Fonte principal no shadPS4:
+  src/core/platform.h
+
+IDs explicitamente modelados:
+  - Compute0RelMem ate Compute6RelMem: 0x00 ate 0x06;
+  - GfxFlip: 0x08;
+  - GpuIdle: 0x09;
+  - GfxEop: 0x40.
+
+O controlador atual e uma tabela C++ de callbacks, nao um controlador de
+interrupcao de hardware ligado a APIC/IOAPIC.
+
+O que deve ser feito no QEMU:
+  - Para a primeira maquina HLE, manter um barramento de eventos HLE separado.
+  - Entregar eventos GPU/VideoOut para equeue como o shadPS4 faz.
+  - Se o guest executar kernel real no futuro, criar linhas qemu_irq e mapear
+    os IDs ao controlador de interrupcoes documentado pelo hardware.
+  - Nao fingir que os IDs acima sao pinos IOAPIC sem evidencia.
+  - Definir ordem, mascaramento, coalescencia e comportamento no reset.
+
+
+10. GPU LIVERPOOL E GNM
+======================================================================
+
+Fontes relevantes no shadPS4:
+  src/video_core/amdgpu/liverpool.cpp
+  src/video_core/amdgpu/liverpool.h
+  src/video_core/amdgpu/pm4_cmds.h
+  src/video_core/amdgpu/pm4_opcodes.h
+  src/video_core/amdgpu/regs.cpp
+  src/video_core/amdgpu/regs.h
+  src/core/libraries/gnmdriver/gnmdriver.cpp
+  src/shader_recompiler/
+  src/video_core/renderer_vulkan/
+  src/video_core/buffer_cache/
+  src/video_core/texture_cache/
+
+Comportamento observado:
+  - modelo logico chamado Liverpool;
+  - uma fila grafica exposta;
+  - sete compute pipes expostos, oito filas por pipe;
+  - buffers DCB, CCB e ACB;
+  - interpretacao de pacotes PM4;
+  - estado de registradores GCN;
+  - eventos EOP, release-memory, flip e idle;
+  - thread propria de GPU e fila de comandos;
+  - cache de buffers/texturas;
+  - recompilacao de shaders;
+  - backend final Vulkan;
+  - muitas entradas GnmDriver ainda sao stubs.
+
+O que deve ser feito no QEMU:
+  - Tratar Liverpool como um subsistema separado da MachineClass.
+  - Definir uma interface limpa entre memoria guest, filas PM4 e renderer.
+  - Remover dependencia direta de Frontend::WindowSDL.
+  - Nao criar Vulkan swapchain dentro do device se a DLL UWP entrega frames
+    ao aplicativo host.
+  - Separar command processor de apresentacao.
+  - Permitir backend Vulkan quando autorizado e um backend de copia/readback
+    para qemu_host_video_callback.
+  - Integrar invalidacao de memoria e dirty tracking ao QEMU.
+  - Definir lifecycle: realize, reset, drain, idle, shutdown e destroy.
+  - Garantir que a thread GPU pare antes de liberar memoria/renderizador.
+  - Criar testes unitarios de pacotes PM4 e registradores sem janela.
+
+Decisao importante:
+  O codigo Liverpool do shadPS4 e uma implementacao HLE do command stream, nao
+  um modelo PCI/MMIO completo. Para a maquina HLE ele pode ser adaptado. Para
+  full-system ainda faltam PCI IDs, BARs, registradores MMIO completos, DMA,
+  firmware da GPU, power management e sequencia real de inicializacao.
+
+
+11. VIDEOOUT, VBLANK E APRESENTACAO
+======================================================================
+
+Fontes relevantes no shadPS4:
+  src/core/libraries/videoout/video_out.cpp
+  src/core/libraries/videoout/driver.cpp
+  src/core/libraries/videoout/driver.h
+  src/video_core/renderer_vulkan/vk_presenter.cpp
+  src/video_core/renderer_vulkan/vk_swapchain.cpp
+
+Comportamento observado:
+  - registra buffers fornecidos pelo jogo;
+  - mantem ate 16 indices de buffer;
+  - registra formato, tiling, largura, altura e pitch;
+  - enfileira flips;
+  - gera eventos flip e vblank em equeue;
+  - mantem contadores, timestamps e estado de flip;
+  - Presenter converte a saida para apresentacao Vulkan/SDL.
+
+O que deve ser feito no QEMU:
+  - Manter VideoOut como servico HLE que controla os buffers do guest.
+  - Fazer o renderer produzir uma superficie linear legivel pelo host.
+  - Entregar pixel pointer, width, height, stride e pixel format pelo callback
+    qemu_host_video_callback.
+  - Reutilizar o display backend host ja criado no QEMU quando houver uma
+    DisplaySurface QEMU; caso o renderer seja externo, criar uma ponte explicita
+    para atualizar essa superficie.
+  - Preservar eventos de flip/vblank independentemente da frequencia de UI.
+  - Nao bloquear a thread do guest esperando o frontend.
+  - Registrar console 0 antes de ele se tornar grafico, comportamento ja
+    previsto em ui/host-display.c.
+  - Definir politica de HDR, formato, scaling e orientacao para UWP.
+
+
+12. AUDIO
+======================================================================
+
+Fontes relevantes no shadPS4:
+  src/core/libraries/audio/audioout.cpp
+  src/core/libraries/audio/audioout_backend.h
+  src/core/libraries/audio/sdl_audio_out.cpp
+  src/core/libraries/audio/openal_audio_out.cpp
+  src/core/libraries/audio/audioin.cpp
+  src/core/libraries/audio/sdl_audio_in.cpp
+  src/core/libraries/audio3d/
+  src/core/libraries/ajm/
+  src/core/libraries/ngs2/
+
+Comportamento observado:
+  - AudioOut abre portas logicas;
+  - entrega blocos PCM periodicamente ao backend;
+  - suporta volume por canal;
+  - backends atuais principais: SDL e OpenAL;
+  - AudioIn depende de captura SDL;
+  - AJM trata codecs, incluindo AAC, MP3 e AT9;
+  - Audio3D e NGS2 adicionam camadas de processamento.
+
+O que deve ser feito no QEMU:
+  - Manter a API AudioOut HLE e substituir o backend por uma ponte QEMU audio.
+  - Usar o backend XAudio2 ja adicionado para saida UWP.
+  - Mapear formato, sample rate, canais, volume, mute e pacing.
+  - Evitar dupla conversao entre formato shadPS4, QEMU e XAudio2.
+  - Implementar drain e parada sem liberar buffers ainda usados pelo XAudio2.
+  - AudioIn precisa de um backend separado; o XAudio2 implementado no QEMU e
+    somente de saida. Captura UWP exigira uma API apropriada do host.
+  - Decodificadores devem ser auditados por dependencias e licencas antes do
+    port para a DLL.
+
+
+13. CONTROLE, MOUSE, TOUCH, MOVIMENTO E FEEDBACK
+======================================================================
+
+Fontes relevantes no shadPS4:
+  src/input/controller.cpp
+  src/input/controller.h
+  src/input/input_handler.cpp
+  src/input/input_mouse.cpp
+  src/core/libraries/pad/pad.cpp
+  src/core/libraries/pad/pad.h
+  src/core/libraries/mouse/
+  src/core/libraries/move/
+
+Estado modelado:
+  - botoes DualShock;
+  - dois analogicos;
+  - gatilhos analogicos;
+  - touchpad com dois toques;
+  - giroscopio;
+  - acelerometro;
+  - orientacao quaternion;
+  - lightbar;
+  - dois motores de vibracao;
+  - ate cinco controladores no gerenciador atual;
+  - mouse separado.
+
+O que deve ser feito no QEMU:
+  - Criar um device/input frontend do hardware especifico ou um barramento HLE
+    de estado de controle.
+  - Expandir a API publica de host para gamepad, eixos, touch, motion,
+    lightbar e rumble; teclado/mouse QEMU nao representam tudo isso.
+  - Reutilizar qemu_host_send_pointer_abs() para mouse absoluto quando aplicavel.
+  - Sincronizar eventos com qemu_input_event_sync(), ja corrigido no host API.
+  - Nao usar SDL dentro da DLL UWP.
+  - O aplicativo UWP deve capturar Gamepad/RawGameController e enviar estado.
+  - Feedback deve sair por callback host, nunca acessar dispositivo diretamente.
+  - Preservar timestamps e fila de estados exigidos por scePadReadState(s).
+
+
+14. FILESYSTEM, STORAGE E CONTEUDO
+======================================================================
+
+Fontes relevantes no shadPS4:
+  src/core/file_sys/
+  src/core/libraries/kernel/file_system.cpp
+  src/core/libraries/save_data/
+  src/core/libraries/app_content/
+  src/core/libraries/playgo/
+  src/core/libraries/disc_map/
+  src/core/file_format/
+
+Mounts observados no boot:
+  /app0
+  /hostapp
+  /data
+  /temp0
+  /temp
+  /download0
+  diretorios sandbox de fontes
+
+Tambem existem handles para console, logger, random, rng, urandom, srandom e
+deci_tty6.
+
+O que deve ser feito no QEMU/UWP:
+  - Manter o VFS HLE; nao mapear esses caminhos diretamente para block devices.
+  - Criar uma interface de filesystem fornecida pelo host embedding.
+  - Resolver caminhos para ApplicationData::Current->LocalFolder ou handles
+    fornecidos pelo aplicativo.
+  - Impedir path traversal e escapes de sandbox.
+  - Definir persistencia por title ID para save data.
+  - Limpar temporarios pelo lifecycle da maquina, sem remover caminhos fora da
+    raiz autorizada.
+  - Separar conteudo read-only de dados gravaveis.
+  - Nao depender de current working directory.
+  - Se um disco virtual real for adicionado futuramente, manter essa camada
+    separada do VFS HLE.
+
+
+15. REDE
+======================================================================
+
+Fontes relevantes no shadPS4:
+  src/core/libraries/network/
+  src/core/libraries/np/
+  src/shadnet/
+
+Comportamento observado:
+  - sockets POSIX traduzidos para sockets host;
+  - netctl, resolver, epoll e HTTP/HTTP2;
+  - SSL/SSL2;
+  - servicos NP e cliente shadnet;
+  - conexao pode ser desabilitada por configuracao.
+
+O que deve ser feito no QEMU/UWP:
+  - Nao reutilizar TAP para esta maquina HLE.
+  - Manter rede como servico HLE sobre API permitida pelo host/UWP.
+  - Definir callbacks ou adaptador para sockets autorizados pelo aplicativo.
+  - Tratar capabilities do manifesto UWP.
+  - Isolar NP/shadnet do core da maquina.
+  - Nunca incorporar credenciais ou tokens na DLL.
+  - Full-system futuro exigiria um NIC virtual e driver guest, que nao estao
+    modelados pelo shadPS4 atual.
+
+
+16. TEMPO, TIMERS E PACING
+======================================================================
+
+Fontes relevantes no shadPS4:
+  src/core/libraries/kernel/time.cpp
+  src/core/libraries/kernel/equeue.cpp
+  src/core/libraries/videoout/driver.cpp
+  src/core/emulator_settings.* para frequencia de vblank
+
+O que deve ser feito no QEMU:
+  - Usar QEMUClock e timers QEMU como fonte base.
+  - Separar realtime, monotonic, process CPU time e thread CPU time.
+  - Entregar timers HLE por equeue.
+  - Derivar vblank do clock virtual, nao de sleep da UI.
+  - Definir comportamento em pause, resume, reset e stepping.
+  - Evitar WINMM e timeBeginPeriod em UWP.
+
+
+17. MODOS BASE, PRO/NEO E DEVKIT
+======================================================================
+
+Fontes relevantes no shadPS4:
+  src/core/emulator_settings.h
+  src/core/emulator_settings.cpp
+  src/core/memory.cpp
+  src/common/elf_info.h
+
+Comportamento observado:
+  - flags isNeo e isDevKit;
+  - tamanhos de memoria diferentes;
+  - sequencias e compatibilidades GPU condicionais;
+  - atributos do param.sfo indicam suporte/necessidade de Neo/VR.
+
+O que deve ser feito no QEMU:
+  - Definir propriedades da maquina, por exemplo variant=base|neo e devkit=on|off.
+  - Nao criar targets separados para cada variante inicialmente.
+  - Aplicar propriedades antes de criar RAM, CPU e GPU.
+  - Validar configuracoes impossiveis e retornar erro claro.
+  - Documentar valores ainda nao confirmados, especialmente DevKit Pro.
+
+
+18. COMPONENTES DE FRONTEND QUE NAO PERTENCEM A MAQUINA
+======================================================================
+
+Nao devem ser portados para o core da DLL:
+  src/sdl_window.cpp
+  src/imgui/
+  UI de configuracao
+  Discord RPC
+  RenderDoc automatico
+  banco de dados de biblioteca de jogos
+  controle de play time
+  notificacoes desktop
+  dialogos de frontend
+  manipulacao direta de icone e titulo da janela
+
+Substituicoes:
+  - video por callback host;
+  - input por funcoes da API host;
+  - log por callback host;
+  - dialogos por eventos/callbacks para o aplicativo;
+  - configuracao por estrutura/API antes de iniciar a maquina;
+  - persistencia por storage fornecido pelo host.
+
+
+19. HARDWARE NAO MODELADO PELO SHADPS4
+======================================================================
+
+A busca na arvore nao encontrou modelos completos e independentes para:
+  - chipset/southbridge real;
+  - enumeracao PCI completa da maquina;
+  - BARs e mapa MMIO completo;
+  - SATA/AHCI real;
+  - controladora Blu-ray;
+  - controladora USB em nivel de hardware;
+  - NIC real e seu driver guest;
+  - UART/serial real;
+  - SMBus/I2C e controladores auxiliares;
+  - ACPI/SMBIOS especificos;
+  - firmware de boot da placa;
+  - secure processor e cadeia completa de seguranca;
+  - power management, thermal e fan control;
+  - firmware e inicializacao low-level da GPU;
+
+Implicacao:
+  Estes componentes nao podem ser inferidos das APIs HLE. Para full-system,
+  cada um exigira documentacao/traces e um DeviceState QEMU com registradores,
+  MMIO/PIO, DMA, IRQ, reset e migracao. Ate isso existir, a maquina deve ser
+  declarada HLE e iniciar diretamente um executavel Orbis.
+
+
+20. ADAPTACOES UWP OBRIGATORIAS
+======================================================================
+
+Dependencias desktop observadas ou provaveis no shadPS4:
+  - SDL3 para janela, input e audio;
+  - Vulkan e criacao de superficie de janela;
+  - OpenAL;
+  - CreateThread/ExitThread;
+  - NT APIs e manipulacao de espaco virtual;
+  - vectored exception handling;
+  - acesso arbitrario a filesystem;
+  - subprocesso/restart;
+  - std::quick_exit().
+
+O que deve ser feito:
+  - remover SDL/OpenAL do core UWP;
+  - usar host display e XAudio2;
+  - receber input do aplicativo host;
+  - substituir filesystem por storage sandboxed;
+  - substituir restart por cleanup + novo init, sem criar processo;
+  - substituir quick_exit por request_shutdown;
+  - auditar imports finais com dumpbin/objdump;
+  - linkar componentes UWP contra WindowsApp.lib quando aplicavel;
+  - executar strip antes de assinatura/empacotamento;
+  - nao considerar strip uma correcao para imports desktop.
+
+
+21. LICENCA E PROVENIENCIA
+======================================================================
+
+Os arquivos centrais inspecionados usam SPDX GPL-2.0-or-later, compativel em
+principio com o projeto QEMU GPL. Isso nao elimina a verificacao arquivo a
+arquivo nem das bibliotecas externas.
+
+Antes de portar:
+  - manter copyright e SPDX de cada arquivo;
+  - registrar origem e revisao exata do shadPS4;
+  - revisar licencas de Zydis, Xbyak, Vulkan helpers, codecs, FFmpeg, OpenAL,
+    SDL e demais dependencias;
+  - nao copiar firmware, chaves, assets ou conteudo de sistema protegido;
+  - preferir adaptar conceitos e interfaces quando uma dependencia nao puder
+    entrar na DLL UWP.
+
+
+22. ARQUITETURA DE DESTINO RECOMENDADA
+======================================================================
+
+Camada 1 - MachineClass QEMU:
+  Propriedades, RAM, CPUs, lifecycle, boot HLE e conexao dos subsistemas.
+
+Camada 2 - Runtime Orbis HLE:
+  Loader, linker, processos, threads, TLS, equeue, VFS e bibliotecas HLE.
+
+Camada 3 - Liverpool command processor:
+  Filas PM4, registradores, eventos, shaders, buffers e texturas.
+
+Camada 4 - Backends host:
+  Video callback, XAudio2, input callbacks, log e storage UWP.
+
+Camada 5 - API publica de embedding:
+  init, start, step, shutdown, reset, cleanup e callbacks.
+
+Regras de dependencia:
+  - MachineClass pode possuir Runtime e Liverpool.
+  - Runtime pode chamar interfaces abstratas de GPU/audio/input/storage.
+  - Liverpool pode acessar memoria guest por interface controlada.
+  - Nenhuma camada interna deve abrir janela ou encerrar o processo.
+  - Backends host nao devem acessar singletons internos sem contexto.
+
+
+23. ORDEM DE IMPLEMENTACAO RECOMENDADA
+======================================================================
+
+Fase 0 - especificacao:
+  - escolher nome definitivo do target e da maquina;
+  - usar o modelo hibrido HLE como contrato definitivo da primeira versao;
+  - escolher um eboot de teste legal e minimo;
+  - documentar os recursos minimos necessarios para esse teste.
+
+Fase 1 - target vazio:
+  - criar target, Kconfig, device config e MachineClass;
+  - gerar DLL com nome dedicado;
+  - inicializar e desligar sem PC/Q35;
+  - validar API host, reset e cleanup repetidos.
+
+Fase 2 - memoria e loader:
+  - criar RAM e mapa de memoria;
+  - portar parser SELF/ELF;
+  - carregar segmentos sem executar;
+  - validar relocacoes e simbolos com testes unitarios.
+
+Fase 3 - CPU e runtime minimo:
+  - preparar ABI, stack, TLS e entry point;
+  - executar codigo simples pelo backend x86/TCG;
+  - implementar excecoes e chamadas HLE minimas.
+
+Fase 4 - kernel HLE:
+  - memoria, threads, sincronizacao, tempo, equeue e filesystem;
+  - remover dependencias de ponteiros host diretos;
+  - garantir shutdown sem deadlock.
+
+Fase 5 - video/GPU:
+  - portar PM4/Liverpool por partes;
+  - primeiro null GPU e eventos;
+  - depois renderer e entrega de frame ao host;
+  - validar vblank, flip, formatos e pitch.
+
+Fase 6 - input e audio:
+  - Pad completo, touch, motion e rumble;
+  - AudioOut sobre XAudio2;
+  - AudioIn somente depois de definir backend UWP.
+
+Fase 7 - conteudo e rede:
+  - save data, app content, dialogs via host e rede HLE;
+  - capabilities UWP e isolamento por titulo.
+
+Fase 8 - compatibilidade:
+  - ampliar bibliotecas HLE por demanda;
+  - tratar stubs observados em logs;
+  - testar variantes base/Neo e diferentes SDKs.
+
+
+24. CRITERIOS DE VALIDACAO
+======================================================================
+
+Build:
+  - configure aceita somente o novo target;
+  - DLL tem nome dedicado;
+  - nao inclui PC/Q35/SDL/GTK/DirectSound/TAP;
+  - imports sao aceitos por UWP;
+  - exports publicos sao apenas os necessarios;
+  - strip e assinatura ocorrem na ordem correta.
+
+Lifecycle:
+  - init/start/step/shutdown/cleanup funciona;
+  - duas execucoes consecutivas no mesmo processo funcionam;
+  - nenhum quick_exit/exit/abort encerra o aplicativo;
+  - threads GPU/audio/runtime sao finalizadas;
+  - callbacks nao ocorrem depois de cleanup.
+
+CPU/memoria:
+  - ELF e relocacoes validados;
+  - acessos invalidos retornam excecao guest, nao crash host;
+  - ponteiros HLE sao validados;
+  - TLS funciona em multiplas threads;
+  - direct/flexible memory respeitam limites por variante.
+
+GPU/video:
+  - PM4 basico executa de forma deterministica;
+  - flip e vblank chegam ao equeue;
+  - callback recebe pointer, width, height, stride e format corretos;
+  - console 0 funciona antes e depois de se tornar grafico;
+  - shutdown durante frame nao causa use-after-free.
+
+Audio/input:
+  - AudioOut nao bloqueia a UI;
+  - volume e canais estao corretos;
+  - gamepad, touch, motion e mouse absoluto preservam timestamps;
+  - feedback sai por callback host.
+
+UWP:
+  - LoadPackagedLibrary carrega a DLL;
+  - GetProcAddress encontra a API host existente;
+  - qemu_host_start_with_args nao existe e nao e usado;
+  - filesystem permanece dentro das raizes autorizadas;
+  - suspend/resume e perda de dispositivo sao tratadas.
+
+
+25. DECISOES QUE PRECISAM SER FECHADAS ANTES DE CODAR
+======================================================================
+
+Decisao ja fechada:
+  - arquitetura de emulacao: maquina hibrida HLE.
+
+Decisoes ainda abertas:
+  1. Nome comercial/tecnico do hardware e nome do target.
+  2. Executar CPU pelo TCG ou manter caminho nativo opcional.
+  3. Modelo exato de CPU, numero de cores e topologia.
+  4. Variante inicial: base, Neo/Pro ou ambas.
+  5. Primeiro eboot de teste e bibliotecas necessarias.
+  6. Vulkan dentro da DLL ou renderer fornecido pelo host.
+  7. Contrato de storage UWP.
+  8. Extensao da API host para gamepad/touch/motion/rumble.
+  9. Estrategia para AudioIn.
+ 10. Politica para modulos LLE opcionais.
+ 11. Limites legais e origem dos dados usados nos testes.
+
+
+26. INDICE DOS PRINCIPAIS PONTOS DE ORIGEM
+======================================================================
+
+Boot e lifecycle:
+  src/main.cpp
+  src/emulator.cpp
+  src/emulator.h
+
+CPU, ABI, sinais e TLS:
+  src/core/cpu_patches.cpp
+  src/core/thread.cpp
+  src/core/signals.cpp
+  src/core/tls.cpp
+
+Memoria:
+  src/core/memory.cpp
+  src/core/memory.h
+  src/core/address_space.cpp
+  src/core/address_space.h
+  src/core/libraries/kernel/memory.*
+
+Loader e linker:
+  src/core/loader/
+  src/core/module.*
+  src/core/linker.*
+  src/core/aerolib/
+
+Kernel/HLE:
+  src/core/libraries/libs.cpp
+  src/core/libraries/kernel/
+  src/core/libraries/libc_internal/
+
+GPU:
+  src/core/libraries/gnmdriver/
+  src/video_core/amdgpu/
+  src/shader_recompiler/
+  src/video_core/renderer_vulkan/
+  src/video_core/buffer_cache/
+  src/video_core/texture_cache/
+
+Video:
+  src/core/libraries/videoout/
+
+Audio:
+  src/core/libraries/audio/
+  src/core/libraries/audio3d/
+  src/core/libraries/ajm/
+  src/core/libraries/ngs2/
+
+Input:
+  src/input/
+  src/core/libraries/pad/
+  src/core/libraries/mouse/
+  src/core/libraries/move/
+
+Filesystem e conteudo:
+  src/core/file_sys/
+  src/core/file_format/
+  src/core/libraries/save_data/
+  src/core/libraries/app_content/
+  src/core/libraries/playgo/
+
+Rede:
+  src/core/libraries/network/
+  src/core/libraries/np/
+  src/shadnet/
+
+
+27. RESULTADO DA ANALISE
+======================================================================
+
+O codigo do shadPS4 e uma fonte valiosa para:
+  - formatos SELF/ELF e linker Orbis;
+  - ABI, TLS e comportamento de processo;
+  - APIs de kernel e bibliotecas HLE;
+  - semantica de direct/flexible memory;
+  - command streams PM4 e GPU Liverpool em nivel alto;
+  - VideoOut, AudioOut e Pad;
+  - compatibilidade observada por jogo.
+
+Ele nao e, sozinho, uma especificacao de placa-mae suficiente para uma
+MachineClass full-system. O caminho tecnicamente coerente e criar uma maquina
+QEMU dedicada de arquitetura x86_64, com boot HLE e subsistemas adaptados do
+shadPS4, mantendo uma fronteira clara para que dispositivos low-level possam
+ser adicionados futuramente sem reescrever o runtime inteiro.
+
+
+28. IMPLEMENTACAO INICIAL DO TARGET HIBRIDO (13/07/2026)
+======================================================================
+
+Estado desta fase:
+  - target: x86_64-shadps4-softmmu;
+  - DLL produzida: qemu-system-shadps4.dll;
+  - maquina QOM: shadps4-machine;
+  - descricao: shadPS4 hybrid HLE machine (x86_64);
+  - acelerador validado: TCG x86_64;
+  - plataforma de build validada: Windows/UCRT64 com -Duwp=true;
+  - audio do build validado: XAudio2;
+  - API de embedding existente preservada;
+  - qemu_host_start_with_args nao foi criado nem usado.
+
+Arquivos adicionados:
+  configs/targets/x86_64-shadps4-softmmu.mak
+    Declara a arquitetura x86_64, o base arch i386 e o nome de sistema
+    "shadps4". QEMU_SYSTEM_NAME desacopla o nome da DLL do TARGET_NAME.
+
+  configs/devices/x86_64-shadps4-softmmu/default.mak
+    Habilita somente CONFIG_SHADPS4_MACHINE e desabilita explicitamente as
+    placas genericas i440FX, ISA PC, Q35, microvm e Nitro Enclave.
+
+  hw/i386/shadps4.c
+    Registra uma MachineClass x86_64 dedicada. A implementacao inicial:
+      - mapeia a RAM diretamente no system memory;
+      - divide os tamanhos abaixo/acima de 4 GiB;
+      - cria CPUs x86 pelo modelo e topologia nativos do QEMU;
+      - configura o limite de APIC IDs;
+      - mantem todas as CPUs estacionadas apos init/reset;
+      - nao cria BIOS, chipset PC, RTC, serial, paralelo ou storage legado;
+      - usa 8 CPUs e 5248 MiB como defaults iniciais.
+
+Arquivos alterados:
+  hw/i386/Kconfig
+    Adiciona CONFIG_SHADPS4_MACHINE, dependente de I386 e selecionando APIC.
+
+  hw/i386/meson.build
+    Compila hw/i386/shadps4.c apenas para CONFIG_SHADPS4_MACHINE.
+    x86-common.c nao e ligado nesse target, evitando dependencias PC/RTC.
+
+  meson.build
+    Aceita QEMU_SYSTEM_NAME por target. O target interno continua sendo
+    x86_64-shadps4-softmmu, mas a biblioteca resultante se chama
+    qemu-system-shadps4.dll.
+
+  tests/qtest/meson.build e tests/functional/meson.build
+    Respeitam QEMU_SYSTEM_NAME e QEMU_SKIP_TESTS. Os testes genericos de PC
+    nao sao aplicados automaticamente a uma maquina que nao implementa PC.
+
+Comando de configuracao validado no MSYS2 UCRT64:
+
+  mkdir -p build-shadps4
+  cd build-shadps4
+  ../configure \
+    --target-list=x86_64-shadps4-softmmu \
+    --enable-uwp \
+    --disable-debug-info \
+    --disable-werror \
+    --disable-docs \
+    --disable-tools \
+    --disable-gtk \
+    --disable-sdl \
+    --disable-bzip2 \
+    --disable-curl \
+    --disable-curses \
+    --disable-dbus-display \
+    --disable-gcrypt \
+    --disable-gio \
+    --disable-gnutls \
+    --disable-libnfs \
+    --disable-libssh \
+    --disable-lzo \
+    --disable-nettle \
+    --disable-opengl \
+    --disable-png \
+    --disable-slirp \
+    --disable-spice \
+    --disable-spice-protocol \
+    --disable-vnc \
+    --disable-vnc-jpeg \
+    --disable-vnc-sasl \
+    --disable-zstd \
+    --enable-xaudio2 \
+    --audio-drv-list=xaudio2
+
+Compilacao e pos-processamento:
+
+  ninja qemu-system-shadps4.dll
+  strip --strip-unneeded qemu-system-shadps4.dll
+
+Resultado validado em build-shadps4-check:
+  - configure concluido;
+  - compilacao e link da DLL concluidos;
+  - CONFIG_SHADPS4_MACHINE=y;
+  - CONFIG_APIC=y;
+  - CONFIG_I440FX, CONFIG_ISAPC, CONFIG_Q35, CONFIG_MICROVM e
+    CONFIG_MC146818RTC ausentes;
+  - tamanho antes do strip: 10.933.875 bytes;
+  - tamanho depois do strip: 7.356.655 bytes;
+  - SHA-256 pos-strip:
+    5A5EAC4913FAD5E8D0A8856DBBB2C85476D6A499A4475D5A9EC0CA9703A24500;
+  - exports qemu_host_init, qemu_host_start e qemu_host_cleanup preservados;
+  - LoadLibrary desktop concluido com as dependencias UCRT64 disponiveis;
+  - GetProcAddress("qemu_host_start") concluido.
+
+O teste LoadLibrary acima e uma verificacao Win32 de integridade e exports. A
+validacao final de compatibilidade continua sendo LoadPackagedLibrary dentro do
+pacote UWP/Xbox, pois esse caminho tambem aplica as restricoes do container.
+
+Limite atual desta primeira fase:
+  A DLL e a maquina dedicada existem e compilam, mas ainda nao carregam um
+  executavel Orbis. As CPUs ficam paradas de proposito. A proxima fase deve
+  implementar o loader SELF/ELF, o mapa de memoria do processo, a preparacao
+  de registradores/TLS/stack e a ponte inicial de syscalls/HLE. Nao deve ser
+  adicionado firmware PC apenas para fazer a maquina iniciar.
+
+
+29. FASE 2 EM ANDAMENTO - MEMORIA E LOADER (13/07/2026)
+======================================================================
+
+Primeiro marco implementado:
+  - parser proprio de ELF64 Orbis little-endian;
+  - reconhecimento de ET_SCE_EXEC, ET_SCE_DYNEXEC e ET_SCE_DYNAMIC;
+  - validacao de EM_X86_64, OSABI FreeBSD e ABI version 0;
+  - parser inicial do container SELF;
+  - suporte a SELF com segmentos em claro e sem compressao;
+  - rejeicao explicita de segmentos SELF criptografados ou comprimidos;
+  - carregamento de PT_LOAD e PT_SCE_RELRO;
+  - copia dos dados do arquivo e preenchimento com zero da area BSS;
+  - coleta de metadados PT_TLS, sem construir o TCB nesta fase;
+  - registro de flags, tamanhos e enderecos de ate 16 segmentos;
+  - validacao de limites do arquivo, RAM, overflow e sobreposicao;
+  - validacao de entry point dentro de um segmento executavel;
+  - CPUs continuam estacionadas depois do carregamento.
+
+Arquivos:
+  hw/i386/shadps4-loader.h
+    Define ShadPS4ImageInfo, metadados dos segmentos e o contrato de
+    enderecamento entre a imagem Orbis e a RAM fisica.
+
+  hw/i386/shadps4-loader.c
+    Implementa o parser seguro, a traducao de segmentos SELF e a copia para o
+    AddressSpace da maquina. O arquivo nao depende do loader PC/x86-common.c.
+
+  hw/i386/shadps4.c
+    Usa o caminho padrao -kernel para receber eboot.bin/ELF. A ausencia de
+    -kernel continua valida e produz a maquina vazia da Fase 1.
+
+Contrato temporario de memoria:
+  - base virtual Orbis: 0x0000000800000000;
+  - staging fisico na RAM: 0x0000000001000000 (16 MiB);
+  - endereco virtual do segmento: base virtual + p_vaddr;
+  - endereco fisico do segmento: staging fisico + p_vaddr;
+  - entry virtual: base virtual + e_entry;
+  - entry fisico registrado: staging fisico + e_entry.
+
+O staging fisico reserva a memoria inicial para estruturas da Fase 3. Ainda
+nao existem page tables ligando a base virtual ao backing fisico. Por isso o
+loader nao altera RIP/CR0/CR3/CR4/EFER e nao libera nenhuma CPU.
+
+Uso atual:
+
+  qemu_host_init(argc, argv)
+
+Argumentos equivalentes:
+
+  qemu-system-shadps4 \
+    -machine shadps4 \
+    -accel tcg,thread=single \
+    -smp 1 \
+    -m 64M \
+    -display none \
+    -nodefaults \
+    -kernel CAMINHO_DO_EBOOT
+
+Nao foi adicionada uma segunda funcao de start. Em particular,
+qemu_host_start_with_args continua inexistente e proibida; os argumentos sao
+fornecidos exclusivamente a qemu_host_init existente.
+
+Validacao executada com imagens sinteticas, sem conteudo comercial:
+  1. ELF64 Orbis ET_SCE_DYNEXEC com um PT_LOAD RX e BSS:
+     - qemu_host_init = 0;
+     - entry virtual = 0x800001000;
+     - entry fisico = 0x1001000;
+     - image size = 0x2000;
+     - qemu_host_cleanup = 0.
+
+  2. SELF equivalente, com segmento em claro e sem compressao:
+     - carregamento concluido com os mesmos enderecos;
+     - qemu_host_cleanup = 0.
+
+  3. SELF sintetico marcado como encrypted:
+     - imagem recusada;
+     - callback de log recebeu
+       "SELF segment 0 is encrypted or compressed";
+     - processo host nao foi encerrado;
+     - cleanup permaneceu funcional.
+
+  4. scripts/checkpatch.pl:
+     - zero erros e zero warnings em shadps4-loader.c;
+     - zero erros e zero warnings em shadps4-loader.h;
+     - zero erros e zero warnings em shadps4.c.
+
+DLL deste marco depois de strip --strip-unneeded:
+  - tamanho: 7.361.775 bytes;
+  - SHA-256:
+    2BECA1FE0F455D7FC128AF989925A1CE5973F7D4D63F85C2A444324E9C9105F7;
+  - qemu_host_init, qemu_host_start e qemu_host_cleanup preservados.
+
+Pendencias restantes depois do primeiro marco:
+  - canal estruturado para o host consultar erro/metadados do loader;
+  - definir uma interface autorizada para SELF criptografado, sem incorporar
+    chaves, firmware ou conteudo protegido.
+
+Preparar stack, TLS de runtime, page tables, registradores e executar o entry
+point pertencem a Fase 3 e nao devem ser misturados ao parser desta fase.
+
+
+30. FASE 2 FUNCIONAL E INICIO DA FASE 3 (13/07/2026)
+======================================================================
+
+Complementos implementados no loader:
+  - leitura e validacao de PT_DYNAMIC;
+  - leitura separada de PT_SCE_DYNLIBDATA;
+  - DT_NULL obrigatorio e limites de 64 MiB para metadados;
+  - DT_SCE_STRTAB/STRSZ e validacao de terminacao de cada nome;
+  - DT_SCE_SYMTAB/SYMENT/SYMTABSZ;
+  - contagem de simbolos definidos e indefinidos;
+  - DT_SCE_RELA/RELASZ/RELAENT;
+  - DT_SCE_JMPREL/PLTRELSZ/PLTREL;
+  - aplicacao de R_X86_64_RELATIVE;
+  - aplicacao de R_X86_64_64 para simbolos definidos na propria imagem;
+  - aplicacao de R_X86_64_GLOB_DAT e R_X86_64_JUMP_SLOT locais;
+  - aplicacao inicial de R_X86_64_DTPMOD64 com module ID 1;
+  - imports weak indefinidos recebem zero;
+  - imports strong indefinidos ficam contabilizados como unresolved;
+  - tipos de relocation desconhecidos sao recusados;
+  - alvos fora dos segmentos carregados sao recusados;
+  - execute=on e bloqueado quando existem relocations nao resolvidas.
+
+Esta etapa fecha o loader funcional de uma imagem isolada. Link de varios
+modulos e resolucao de imports contra bibliotecas HLE passam a pertencer ao
+runtime da Fase 3. O loader nao inventa enderecos para simbolos externos.
+
+Inicio da Fase 3:
+  Nova propriedade de maquina:
+
+    -machine shadps4,execute=on
+
+  O default e execute=off para continuar permitindo apenas inspecionar e
+  validar imagens. Quando execute=on:
+    - cinco paginas de bootstrap sao reservadas a partir de 0x1000;
+    - PML4 fica em 0x1000;
+    - PDPT fica em 0x2000;
+    - paginas de 2 MiB mapeiam os primeiros 64 MiB por identidade;
+    - a imagem em 0x800000000 mapeia para o staging fisico em 0x01000000;
+    - uma stack de 2 MiB usa backing fisico em 0x00800000;
+    - stack virtual ocupa 0x7ffe00000 ate 0x800000000;
+    - CR3 recebe 0x1000;
+    - CR4 habilita PAE, PSE, OSFXSR e OSXMMEXCPT;
+    - EFER habilita LME, LMA pelo update de CR0, NXE e SCE;
+    - CR0 habilita PE, NE, WP e PG;
+    - CS recebe descritor 64-bit e segmentos de dados recebem base zero;
+    - RIP recebe o entry virtual relocacionado;
+    - RSP recebe 0x7fffffff0, alinhado a 16 bytes;
+    - registradores de argumentos iniciam em zero;
+    - somente a bootstrap CPU e liberada.
+
+Limitacoes intencionais do bootstrap atual:
+  - executa em CPL0; ring 3 ainda nao foi preparado;
+  - suporta inicialmente ate 1 GiB de imagem contigua;
+  - nao constroi argv/auxv/procparam Orbis;
+  - nao constroi TCB nem configura FS/GS para TLS;
+  - nao instala GDT/IDT/TSS reais na memoria guest;
+  - nao trata syscall, excecao ou page fault como chamada HLE;
+  - nao inicia modulos dependentes nem init arrays;
+  - nao executa SELF criptografado/comprimido;
+  - um eboot comercial ainda nao deve ser iniciado com execute=on.
+
+Teste permanente adicionado:
+  tests/shadps4/test_loader.py
+  tests/shadps4/README.txt
+
+O teste gera um ELF original e sintetico ET_SCE_DYNEXEC com:
+  - PT_LOAD;
+  - PT_DYNAMIC;
+  - PT_SCE_DYNLIBDATA;
+  - string e symbol tables validas;
+  - uma relocation R_X86_64_RELATIVE;
+  - codigo que compara o valor relocacionado;
+  - caminho correto terminando em HLT;
+  - caminho de erro terminando em UD2.
+
+Comando validado:
+
+  build-shadps4-check/pyvenv/bin/python.exe \
+    tests/shadps4/test_loader.py \
+    build-shadps4-check/qemu-system-shadps4.dll
+
+Resultado:
+  shadPS4 loader/TCG smoke test: PASS
+
+O trace confirmou execucao TCG em:
+  - 0x800001000: leitura e comparacao do valor relocacionado;
+  - 0x800001019: HLT;
+  - 0x80000101a/UD2 nao foi executado.
+
+Lifecycle confirmado pelo harness nativo e pelo teste ctypes:
+  - qemu_host_init = 0;
+  - qemu_host_main_loop_step executou a imagem;
+  - qemu_host_request_shutdown = 0;
+  - main loop retornou status 0;
+  - qemu_host_cleanup = 0;
+  - nenhuma funcao qemu_host_start_with_args foi adicionada.
+
+DLL final deste marco depois de strip --strip-unneeded:
+  - tamanho: 7.370.479 bytes;
+  - SHA-256:
+    20DBE769020393825BF3BDCC598D639C57A456C90B78C386FA9C4F9BA49F615C;
+  - smoke test repetido contra a DLL stripada: PASS;
+  - qemu_host_init, qemu_host_start e qemu_host_cleanup preservados.
+
+
+31. FASE 3 FUNCIONAL E INICIO DA FASE 4 (13/07/2026)
+======================================================================
+
+Fase 3 implementada no bootstrap de processo:
+  - o entry point agora inicia em CPL3, com CS=0x23 e SS/DS/ES=0x1b;
+  - GDT real instalada em 0x7000;
+  - TSS64 real instalada em 0x8000, com RSP0 em 0x200000;
+  - IDT com 256 gates instalada em 0xa000;
+  - excecoes entram em CPL0, trocam para RSP0 e param em um handler seguro;
+  - paginas baixas de bootstrap sao supervisor-only;
+  - imagem, stack e TLS possuem paginas acessiveis a CPL3;
+  - stack inicial segue o formato usado por RunMainEntry do shadPS4;
+  - RDI aponta para EntryParams com argc, argv[0] e entry_addr;
+  - RSI aponta para um trampoline de encerramento chamavel em CPL3;
+  - argc e argv[0] tambem sao materializados no topo da stack;
+  - dados PT_TLS ficam no inicio da area e o TCB vem depois do TLS estatico;
+  - GS base aponta para o TCB, como no modelo FreeBSD usado pelo shadPS4;
+  - TCB contem self pointer e ponteiro para a DTV inicial;
+  - DTV contem geracao, quantidade de modulos e ponteiro do modulo 1;
+  - PT_TLS, quando presente dentro de PT_LOAD, e copiado para a area TLS;
+  - BSS de TLS permanece zerada pela inicializacao da area;
+  - a stack continua com 2 MiB em 0x7ffe00000..0x800000000;
+  - o trampoline de saida fica no fim da area TLS, sem expor o gateway.
+
+Inicio funcional da Fase 4:
+  - MSR STAR, LSTAR, CSTAR e FMASK sao configurados no bootstrap;
+  - SYSCALL troca de CPL3 para o stub supervisor em 0x9000;
+  - o stub publica o numero da chamada no MMIO privado em 0x6000;
+  - o resultado e lido de 0x6008 antes de SYSRETQ;
+  - a MemoryRegion exige acessos atomicos de 64 bits no TCG;
+  - syscall 1 implementa exit e solicita shutdown limpo do QEMU;
+  - syscall 20 implementa getpid e retorna o PID virtual 1;
+  - chamadas desconhecidas retornam -78, o ENOSYS do ABI FreeBSD/Orbis;
+  - errno do CRT Windows nao vaza para o ABI convidado;
+  - o MMIO HLE nao e acessivel diretamente a CPL3;
+  - qemu_host_start_with_args nao foi criado nem usado.
+
+Layout adicional deste marco:
+  0x00006000  MMIO supervisor do gateway HLE
+  0x00007000  GDT
+  0x00008000  TSS64
+  0x00009000  stub SYSCALL/SYSRETQ
+  0x0000a000  IDT
+  0x0000b000  handler minimo de excecao
+  0x00600000  backing fisico de TLS/TCB
+  0x00800000  backing fisico da stack
+  0x7ffc00000  base virtual dos dados TLS estaticos
+  apos TLS      TCB e DTV; GS base aponta para o TCB
+  0x7ffdfff00  trampoline virtual de exit
+  0x7ffe00000  base virtual da stack
+  0x800000000  base virtual da imagem
+
+Teste funcional ampliado:
+  tests/shadps4/test_loader.py agora verifica, dentro do guest:
+  - CS=0x23, provando entrada em CPL3;
+  - PT_TLS copiado antes do TCB e GS:[0] igual ao proprio TCB;
+  - argc em EntryParams e RSI apontando para o trampoline de exit;
+  - valor produzido por R_X86_64_RELATIVE;
+  - syscall desconhecida retornando -ENOSYS;
+  - getpid retornando 1;
+  - exit(0) encerrando o main loop do embedding;
+  - caminho UD2 nao executado.
+
+Comando validado antes do strip:
+
+  C:/msys64/ucrt64/bin/python.exe \
+    tests/shadps4/test_loader.py \
+    build-shadps4-check/qemu-system-shadps4.dll
+
+Resultado:
+  shadPS4 loader/TCG smoke test: PASS
+
+DLL final deste marco depois de strip --strip-unneeded:
+  - tamanho: 7.374.575 bytes;
+  - SHA-256:
+    F7FD64E1D5211FC082A9678A2D793D83A9270C202949AA82E6618A742BE22E22;
+  - smoke test repetido contra a DLL stripada: PASS;
+  - exports qemu_host_init, qemu_host_start, qemu_host_main_loop_step,
+    qemu_host_request_shutdown e qemu_host_cleanup preservados;
+  - qemu_host_start_with_args ausente da tabela de exports.
+
+
+Limitacoes deliberadas no inicio da Fase 4:
+  - somente exit e getpid possuem implementacao HLE;
+  - argumentos de exit ainda nao sao persistidos como status de processo;
+  - excecoes apenas estacionam a CPU; ainda nao viram sinais Orbis;
+  - nao existe dispatcher modular nem tabela extensa de syscalls;
+  - nao existe scheduler de threads de usuario;
+  - TCB/DTV cobre apenas o modulo inicial e ainda nao executa init arrays;
+  - EntryParams inicial nao substitui todo o procparam/auxv do Orbis;
+  - permissoes R/W/X ainda sao agregadas por paginas grandes de 2 MiB;
+  - bibliotecas dependentes e imports HLE continuam pendentes;
+  - SELF criptografado ou comprimido continua fora do loader atual.
+
+Proximos passos da Fase 4:
+  1. separar o dispatcher HLE em modulo proprio e testar sua tabela;
+  2. implementar syscalls de memoria virtual, clocks e identificacao;
+  3. converter faults/excecoes em sinais ou erros controlados;
+  4. criar threads, TCB/DTV por thread e scheduler minimo;
+  5. resolver imports autorizados contra bibliotecas HLE;
+  6. aplicar permissoes de pagina por segmento e W^X onde aplicavel.
+
+
+
+32. FASE 4 FUNCIONAL E INICIO DA FASE 5 (13/07/2026)
+======================================================================
+
+Fechamento funcional da infraestrutura da Fase 4:
+  - dispatcher HLE removido de shadps4.c e isolado em shadps4-hle.c;
+  - argumentos sao lidos dos registradores guest, sem converter enderecos
+    guest em ponteiros host;
+  - leitura e escrita de buffers usa cpu_memory_rw_debug e a MMU da CPU;
+  - errno usado pelo ABI guest permanece independente do CRT Windows;
+  - tabela inicial de syscalls FreeBSD/Orbis implementada;
+  - getpid, getuid, geteuid, getgid e getegid implementados;
+  - thr_self escreve o ID logico 1 na memoria guest;
+  - thr_exit encerra o processo inicial sem chamar exit no host;
+  - clock_gettime e gettimeofday escrevem estruturas na memoria guest;
+  - mmap e munmap gerenciam uma arena virtual dedicada em 0x1000000000;
+  - mmap atualiza page tables guest e limpa o backing fisico antes do uso;
+  - munmap remove os PDEs e invalida o TLB;
+  - permissoes PROT_WRITE e PROT_EXEC controlam W e NX na arena dinamica;
+  - segmentos ELF propagam PF_W/PF_X para PDEs de 2 MiB;
+  - stack e TLS sao NX;
+  - read/write/open/close usam uma tabela de descritores virtuais;
+  - /dev/null, /dev/zero e /dev/gc nao abrem handles Win32;
+  - stdout/stderr seguem o canal de log do QEMU;
+  - kqueue cria handles virtuais e kevent faz polling nao bloqueante;
+  - eventos vblank pendentes podem ser entregues como uma kevent guest;
+  - _umtx_op possui o primeiro caminho cooperativo de wake;
+  - acessos de I/O possuem limites para impedir loops host sem controle;
+  - excecoes nao tratadas entram pelo IDT/TSS e solicitam shutdown limpo;
+  - exit usa espera neutra enquanto o main loop consome o shutdown;
+  - rollback basico evita deixar mmap parcialmente instalado;
+  - qemu_host_start_with_args continua inexistente e proibido.
+
+Novos arquivos:
+  hw/i386/shadps4-hle.h
+  hw/i386/shadps4-hle.c
+    Estado por maquina, descritores, equeues, arena mmap e dispatcher HLE.
+
+  hw/i386/shadps4-gpu.h
+  hw/i386/shadps4-gpu.c
+    Primeiro dispositivo Liverpool: null-GPU sem renderer e sem janela.
+
+Inicio da Fase 5:
+  - null-GPU pertence ao estado da maquina, sem singleton host;
+  - timer virtual de 60 Hz contabiliza vblank;
+  - submit contabiliza command buffers aceitos, sem interpretar PM4;
+  - flip contabiliza apresentacoes aceitas, sem produzir frame;
+  - status retorna submit_count, flip_count e vblank_count;
+  - /dev/gc e um descritor virtual, nao um device desktop;
+  - ioctls privados temporarios do bootstrap:
+      0xc0108101  submit;
+      0xc0108102  flip;
+      0x80188103  status com tres contadores u64;
+  - cleanup cancela e libera o timer, impedindo callback tardio.
+
+Mapa adicional:
+  0x0000d000     page directory da arena dinamica
+  0x1000000000   base virtual de mmap
+  backing fisico inicia em pelo menos 32 MiB e nunca sobrepoe a imagem;
+  cada slot usa uma pagina grande de 2 MiB.
+
+Syscalls cobertas neste marco:
+  1    exit
+  3    read
+  4    write
+  5    open
+  6    close, incluindo equeue
+  20   getpid
+  24   getuid
+  25   geteuid
+  43   getegid
+  47   getgid
+  54   ioctl para o null-GPU
+  73   munmap
+  116  gettimeofday
+  232  clock_gettime
+  362  kqueue
+  363  kevent nao bloqueante
+  431  thr_exit
+  432  thr_self
+  454  _umtx_op wake inicial
+  477  mmap
+
+Teste funcional ampliado:
+  - valida identidade e thr_self;
+  - valida clock_gettime escrevendo em memoria guest;
+  - cria mmap de 2 MiB, escreve/le e executa munmap;
+  - abre /dev/gc e recebe fd virtual 3;
+  - envia submit e flip ao null-GPU;
+  - consulta status e confirma os dois contadores;
+  - fecha o descritor GPU;
+  - cria, consulta e fecha uma equeue;
+  - executa _umtx_op wake;
+  - confirma ENOSYS para syscall desconhecida;
+  - executa getpid e exit;
+  - uma segunda imagem corrompida confirma o shutdown por excecao;
+  - os dois casos terminam via embedding sem encerrar o processo host.
+
+Limites que passam para a evolucao do runtime e da Fase 5:
+  - thr_new e escalonamento de varias threads ainda nao existem;
+  - espera bloqueante de umtx/equeue ainda nao estaciona e acorda vCPUs;
+  - filesystem deste marco contem somente devices virtuais seguros;
+  - imports de bibliotecas continuam exigindo resolucao/link HLE autorizada;
+  - granularidade de permissao da imagem ainda e 2 MiB;
+  - o fault HLE ainda nao constroi sinais Orbis nem informa o vetor;
+  - ioctls null-GPU sao um contrato temporario de bootstrap;
+  - PM4, registradores Liverpool, filas reais e shaders nao foram portados;
+  - flip ainda nao chama o callback de video nem entrega framebuffer;
+  - vblank nao possui sincronizacao bloqueante com a thread guest.
+
+Proximos passos da Fase 5:
+  1. substituir ioctls temporarios por exports HLE Gnm/VideoOut;
+  2. criar filas Liverpool e parser PM4 com validacao de bounds;
+  3. implementar registradores e eventos/fences necessarios ao primeiro teste;
+  4. associar flip a superficies guest com formato e pitch explicitos;
+  5. entregar frame pelo callback host-display existente;
+  6. manter um renderer null como fallback deterministico para testes.
+
+DLL final deste marco depois de strip --strip-unneeded:
+  - tamanho: 7.379.695 bytes;
+  - SHA-256:
+    E15DD15CC7EE8434125454A7D10AA99B5867194CC5EDA2E894B0372EADF5216E;
+  - teste funcional normal contra a DLL stripada: PASS;
+  - teste de excecao controlada contra a DLL stripada: PASS;
+  - qemu_host_init, qemu_host_start, qemu_host_main_loop_step,
+    qemu_host_request_shutdown e qemu_host_cleanup preservados;
+  - qemu_host_start_with_args ausente da tabela de exports.
+
+33. FASE 5 FUNCIONAL E INICIO DA FASE 6 (13/07/2026)
+======================================================================
+
+Fechamento funcional do primeiro backend Liverpool da Fase 5:
+  - submit deixou de ser apenas um contador e recebe um descritor validado;
+  - cada submit informa endereco guest, quantidade de dwords, fila, endereco
+    de fence e valor de fence;
+  - existem oito filas logicas com contagem e ultimo fence concluido;
+  - command buffers sao copiados da memoria guest com cpu_memory_rw_debug;
+  - command buffers vazios, grandes demais ou com fila invalida sao rejeitados;
+  - o parser inicial aceita somente pacotes PM4 type 3 de uma whitelist;
+  - NOP, WRITE_DATA, EVENT_WRITE_EOP, SET_CONTEXT_REG e SET_SH_REG sao
+    reconhecidos com validacao de tamanho e limites de registradores;
+  - opcodes desconhecidos e pacotes truncados sao rejeitados de forma limpa;
+  - registradores de contexto e shader possuem estado por maquina;
+  - fence concluido e escrito em little-endian na memoria guest;
+  - status completo informa submits, flips, vblanks, pacotes interpretados,
+    submits rejeitados e ultimo fence;
+  - o status legado de 24 bytes em 0x80188103 continua compativel;
+  - o status completo de 48 bytes usa o comando 0x80308103;
+  - flip recebe endereco, width, height, stride e formato explicitos;
+  - width, height, stride, tamanho total e pixel format sao validados;
+  - BGRA8888, RGBA8888, RGBX8888 e BGRX8888 sao aceitos;
+  - o framebuffer e copiado antes da chamada ao host;
+  - o callback de video recebe bytes, width, height, stride e formato;
+  - o null renderer continua disponivel para submits sem rasterizacao;
+  - timer virtual de vblank e cleanup seguro foram preservados.
+
+API publica de callbacks corrigida:
+  - system/host.c agora implementa os registros e emissores que ja estavam
+    declarados em include/qemu/qemu-host.h;
+  - callbacks de log, video e audio possuem estado protegido por GMutex;
+  - o callback e chamado fora do mutex para permitir reentrada do host;
+  - consumidores internos da DLL nao geram referencias MinGW __imp_*;
+  - exports adicionados e confirmados:
+      qemu_host_register_log_callback
+      qemu_host_log_callback_enabled
+      qemu_host_emit_log
+      qemu_host_register_video_callback
+      qemu_host_emit_video_frame
+      qemu_host_register_audio_callback
+      qemu_host_emit_audio_frame
+
+Inicio funcional da Fase 6:
+  - novo device QOM/SysBus shadps4-io, criado e destruido com a maquina;
+  - handler QEMU aceita KEY, BTN, REL e ABS;
+  - Space, Escape, Enter, setas e WASD alimentam o estado do pad;
+  - mouse esquerdo/direito alimenta botoes virtuais;
+  - movimento relativo e posicao absoluta alimentam pointer_x/pointer_y;
+  - cada input sync incrementa a sequencia do estado;
+  - /dev/pad pode ser aberto, lido e fechado pelo ABI guest;
+  - o estado binario do pad tem layout little-endian estavel de 40 bytes;
+  - ioctl 0xc0048202 atualiza rumble pequeno e grande;
+  - /dev/audioout pode ser aberto, configurado, escrito e fechado;
+  - ioctl 0xc00c8201 configura sample rate, canais e formato;
+  - AudioOut aceita U8, S16, S32 e F32, de um a oito canais;
+  - blocos PCM sao limitados a 256 KiB e copiados da memoria guest;
+  - o callback de audio recebe bytes, tamanho, sample rate, canais e formato;
+  - captura absoluta foi validada por qemu_host_send_pointer_abs e
+    qemu_host_pointer_is_absolute.
+
+Arquivos novos deste marco:
+  hw/i386/shadps4-io.h
+  hw/i386/shadps4-io.c
+
+Arquivos principais ampliados:
+  hw/i386/shadps4-gpu.h
+  hw/i386/shadps4-gpu.c
+  hw/i386/shadps4-hle.h
+  hw/i386/shadps4-hle.c
+  hw/i386/shadps4.c
+  hw/i386/meson.build
+  system/host.c
+  include/qemu/qemu-host.h
+  tests/shadps4/test_loader.py
+
+Teste funcional deste marco:
+  - monta um ELF Orbis sintetico e executa em CPL3 pelo TCG;
+  - envia um PM4 type-3 NOP estruturado;
+  - confirma fence 0x55 e todos os campos do status completo;
+  - faz flip de uma superficie BGRA 2x2 com pitch de 8 bytes;
+  - compara no host os 16 bytes exatos recebidos pelo callback de video;
+  - injeta Space e posicao absoluta pela API publica;
+  - le /dev/pad e confirma Cross, layout e rumble;
+  - configura AudioOut como PCM S16, 48 kHz, stereo;
+  - compara no host os 16 bytes exatos recebidos pelo callback de audio;
+  - repete separadamente o caminho de excecao controlada;
+  - os dois casos encerram pelo embedding sem encerrar o processo host.
+
+Como reproduzir o build incremental:
+
+  $env:HOME=(Resolve-Path .\build-shadps4-check).Path
+  $env:CHERE_INVOKING='1'
+  $env:MSYSTEM='UCRT64'
+  & C:\msys64\usr\bin\bash.exe --noprofile --norc -c `
+    'export PATH=/ucrt64/bin:/usr/bin; cd build-shadps4-check; `
+     ninja qemu-system-shadps4.dll'
+
+Como executar o teste:
+
+  C:\msys64\ucrt64\bin\python.exe `
+    tests\shadps4\test_loader.py `
+    build-shadps4-check\qemu-system-shadps4.dll
+
+Como finalizar o artefato:
+
+  C:\msys64\ucrt64\bin\strip.exe --strip-unneeded `
+    build-shadps4-check\qemu-system-shadps4.dll
+
+DLL final deste marco depois de strip --strip-unneeded:
+  - tamanho: 7.384.815 bytes;
+  - SHA-256:
+    55044D577622648E82B03877E5C67EC1BAC24239BA315967EDE76E54586E461B;
+  - teste funcional normal contra a DLL stripada: PASS;
+  - teste de excecao controlada contra a DLL stripada: PASS;
+  - exports de lifecycle, log, video, audio e input preservados;
+  - qemu_host_start_with_args permanece ausente.
+
+Limites deliberados que permanecem na Fase 5 evolutiva:
+  - o parser PM4 cobre somente a whitelist necessaria ao primeiro teste;
+  - WRITE_DATA e EVENT_WRITE_EOP ainda nao executam toda a semantica Liverpool;
+  - nao existem shader recompiler, rasterizacao ou renderer Vulkan;
+  - flip aceita somente superficies lineares de 32 bits;
+  - tiling, swizzle, texturas, HDR e multiplos buffers VideoOut nao existem;
+  - imports NID de GnmDriver/VideoOut ainda dependem do futuro resolvedor HLE;
+  - os ioctls privados continuam sendo o contrato de bootstrap do teste.
+
+Proximos passos da Fase 6:
+  1. adicionar analogicos, touch e motion ao contrato de input do host;
+  2. transformar rumble armazenado em callback de saida para o host;
+  3. implementar portas e filas AudioOut com temporizacao e backpressure;
+  4. ligar AudioOut ao backend XAudio2 existente, mantendo callback opcional;
+  5. tratar drain, reset e troca de formato sem callbacks tardios;
+  6. adicionar AudioIn somente depois de definir permissao e backend UWP.
+
+
+34. FASE 6 FUNCIONAL E INICIO DA FASE 7 (13/07/2026)
+======================================================================
+
+Fechamento funcional da Fase 6 - input:
+  - a API publica aceita ate cinco controles por indice;
+  - QemuHostGamepadState transporta botoes, dois analogicos, dois gatilhos,
+    conexao e timestamp fornecido pelo host;
+  - QemuHostTouchState transporta dois toques com ID, posicao e atividade;
+  - coordenadas touch nao finitas sao zeradas e limitadas a 0..1;
+  - QemuHostMotionState transporta acelerometro, giroscopio e quaternion;
+  - valores motion nao finitos sao sanitizados antes de chegar ao guest;
+  - /dev/pad e /dev/pad0..4 selecionam o controle correspondente;
+  - leitura de 40 bytes preserva o estado legado;
+  - leitura de 104 bytes entrega gatilhos, conexao, dois toques, motion,
+    lightbar/rumble e timestamp em layout little-endian estavel;
+  - teclado, mouse relativo e mouse absoluto continuam alimentando pad0;
+  - ioctl 0xc0088203 recebe rumble pequeno/grande e RGB da lightbar;
+  - qemu_host_register_pad_output_callback devolve feedback ao aplicativo;
+  - o core nao acessa gamepad, lightbar ou motores do host diretamente.
+
+Fechamento funcional da Fase 6 - AudioOut:
+  - shadps4-io possui propriedade QEMU audiodev;
+  - um audiodev com id shadps4 e selecionado automaticamente;
+  - AudioOut abre SWVoiceOut pelo AudioBackend moderno do QEMU;
+  - blocos PCM entram em fila limitada a 1 MiB com backpressure;
+  - o callback do AudioBackend drena a fila conforme espaco disponivel;
+  - o callback publico UWP continua recebendo o mesmo bloco;
+  - U8, S16, S32 e F32, 8..192 kHz e 1..8 canais sao validados;
+  - ioctl 0xc00c8201 configura formato, frequencia e canais;
+  - ioctl 0xc00c8204 configura mute e volume por canal;
+  - ioctl 0x80088203 consulta bytes ainda na fila QEMU;
+  - ioctl 0x20008202 tenta drain e retorna EAGAIN com backpressure;
+  - reset/unrealize para a voz, faz flush e fecha o backend antes das filas;
+  - XAudio2 copia cada buffer e o libera em OnBufferEnd;
+  - XAudio2 UWP agora usa RoInitialize, nunca CoInitialize;
+  - RoUninitialize ocorre somente quando a inicializacao foi adquirida;
+  - RPC_E_CHANGED_MODE preserva o apartment escolhido pelo host;
+  - configuracao de producao validada:
+
+      -audiodev xaudio2,id=shadps4
+
+Fechamento funcional da Fase 6 - AudioIn:
+  - qemu_host_send_audio_input define a captura fornecida pelo host;
+  - formato, sample rate, canais, ponteiro e tamanho sao validados;
+  - o dispositivo copia as amostras para fila limitada a 1 MiB;
+  - /dev/audioin entrega os bytes ao guest sem API desktop de captura;
+  - permissao e captura UWP permanecem responsabilidade do aplicativo;
+  - nenhuma dependencia de SDL capture foi adicionada.
+
+Inicio funcional da Fase 7 - storage e conteudo:
+  - QemuHostStorageCallbacks e versionado com size/version;
+  - callbacks obrigatorios: open, read, write e close;
+  - handles sao int64 opacos, nunca HANDLE Win32;
+  - o host recebe caminhos virtuais, flags e mode do ABI guest;
+  - mounts inicialmente autorizados:
+      /app0/       conteudo do aplicativo;
+      /data/       save data persistente;
+      /temp/       temporarios;
+      /temp0/      temporarios de titulo;
+      /download0/  conteudo baixado autorizado;
+  - caminhos com backslash, drive, //, componente . ou .. sao rejeitados;
+  - nenhum caminho depende do current working directory;
+  - descritores storage participam da tabela de FDs HLE;
+  - reset fecha handles ainda abertos antes de limpar a tabela;
+  - callbacks com tamanho maior que o solicitado viram EIO;
+  - o aplicativo UWP deve mapear /data para LocalFolder por title ID;
+  - o QEMU nao concatena caminhos host nem escapa da raiz fornecida.
+
+Novos exports confirmados:
+  qemu_host_send_gamepad_state
+  qemu_host_send_touch_state
+  qemu_host_send_motion_state
+  qemu_host_send_audio_input
+  qemu_host_register_pad_output_callback
+  qemu_host_register_storage_callbacks
+
+Teste funcional ampliado:
+  - injeta botoes, analogicos, gatilhos e conexao no pad0;
+  - injeta touch e motion com timestamp conhecido;
+  - o guest valida o layout estendido de 104 bytes;
+  - o guest emite rumble/lightbar e o host valida todos os campos;
+  - o host injeta 16 bytes de AudioIn e o guest valida byte a byte;
+  - AudioOut configura S16 stereo 48 kHz e volume por canal;
+  - /data/test.bin e lido por callbacks de storage;
+  - /data/out.bin e escrito e comparado no host byte a byte;
+  - o teste passa com audiodev none e audiodev xaudio2;
+  - a excecao controlada continua encerrando sem matar o host.
+
+Comandos de validacao:
+
+  C:\msys64\ucrt64\bin\python.exe `
+    tests\shadps4\test_loader.py `
+    build-shadps4-check\qemu-system-shadps4.dll
+
+  $env:SHADPS4_TEST_AUDIODEV='xaudio2'
+  C:\msys64\ucrt64\bin\python.exe `
+    tests\shadps4\test_loader.py `
+    build-shadps4-check\qemu-system-shadps4.dll
+
+DLL final depois de strip --strip-unneeded:
+  - tamanho: 7.394.780 bytes;
+  - SHA-256:
+    3CE2A4C139329E4E19236704CEA397BFECD42EBEE7E7343D3F9C28699457859D;
+  - teste com audiodev none contra a DLL stripada: PASS;
+  - teste com audiodev xaudio2 contra a DLL stripada: PASS;
+  - checkpatch: zero erros nos arquivos C/H modificados;
+  - novos exports preservados depois do strip;
+  - qemu_host_start_with_args permanece ausente.
+
+Limites do inicio da Fase 7:
+  - ainda nao existem mkdir, unlink, rename, stat, lseek ou enumeracao;
+  - app0 read-only ainda depende da politica aplicada pelo callback host;
+  - title ID ainda nao e propriedade obrigatoria da maquina;
+  - dialogos ainda nao possuem protocolo de request/response;
+  - rede HLE e capabilities do manifesto ainda nao foram iniciadas;
+  - callbacks storage atuais sao sincronicos e nao devem bloquear a UI.
+
+Proximos passos da Fase 7:
+  1. ampliar o VFS com seek, stat, diretorios e saves atomicos;
+  2. tornar title ID obrigatorio e separar raiz persistente/temporaria;
+  3. aplicar read-only em app0 tambem dentro do core;
+  4. definir protocolo assincrono de dialogos e notificacoes;
+  5. criar rede HLE por callbacks autorizados, sem TAP;
+  6. documentar capabilities UWP exigidas por cada servico.
+
+
+35. FASE 7 FUNCIONAL - CONTEUDO, DIALOGOS E REDE
+=================================================
+
+Estado final:
+  - os itens que estavam listados como limites do inicio da Fase 7 foram
+    implementados;
+  - a API publica continua versionada por size/version e nao contem
+    qemu_host_start_with_args;
+  - nenhum HANDLE, socket Win32, picker ou API de UI atravessa a fronteira;
+  - o aplicativo UWP continua dono de ApplicationData, UI e permissao de rede.
+
+Identidade e isolamento:
+  - execute=on exige -M shadps4,title-id=IDENTIFICADOR;
+  - title-id aceita 1..32 caracteres: A..Z, 0..9, underscore e hifen;
+  - um ID ausente/invalido impede a execucao HLE com erro limpo;
+  - todo mount autorizado e entregue ao host como:
+      /titles/<TITLE_ID>/app0/...
+      /titles/<TITLE_ID>/data/...
+      /titles/<TITLE_ID>/temp/...
+      /titles/<TITLE_ID>/temp0/...
+      /titles/<TITLE_ID>/download0/...
+  - /app0 e read-only no core, inclusive para open e write;
+  - componentes vazios, '.', '..', backslash, drive e caminhos fora dos mounts
+    continuam rejeitados antes do callback.
+
+Storage callback ABI v2:
+  - mantem os quatro callbacks v1: open, read, write e close;
+  - acrescenta seek, stat, mkdir, unlink, rename, flush, readdir,
+    atomic_replace e cleanup;
+  - QemuHostStorageStat transporta tamanho, tamanho alocado, mtime, mode e tipo;
+  - QEMU_HOST_STORAGE_OPEN_DIRECTORY identifica handles de diretorio;
+  - callbacks opcionais ausentes retornam ENOSYS sem acessar APIs desktop;
+  - syscalls HLE cobertas: unlink(10), fsync(95), rename(128), mkdir(136),
+    stat(188), fstat(189), getdirentries(196) e lseek(478);
+  - ioctl 0xc0108301 executa substituicao atomica de save pelo host;
+  - saida, fault, reset e finalizacao fecham handles storage/rede;
+  - a limpeza e idempotente e solicita cleanup de temp e temp0 por titulo.
+
+Dialogos:
+  - /dev/dialog transforma write em request assincrono com ID monotonicamente
+    crescente;
+  - qemu_host_register_dialog_callback entrega tipo, ID e payload ao host;
+  - qemu_host_complete_dialog conclui a operacao sem bloquear a thread de UI;
+  - read devolve cabecalho com request ID, status e payload size, seguido do
+    payload;
+  - a fila de respostas e limitada a 16 entradas e valida ponteiro/tamanho.
+
+Rede por capabilities:
+  - qemu_host_register_network_callbacks recebe uma tabela versionada;
+  - callbacks cobertos: socket, connect, send, recv e close;
+  - QEMU_HOST_NETWORK_INTERNET_CLIENT autoriza Internet publica;
+  - QEMU_HOST_NETWORK_PRIVATE_CLIENT autoriza loopback e redes IPv4 privadas;
+  - socket sem internetClient e connect privado sem privateNetworkClientServer
+    falham com EACCES antes do callback sensivel;
+  - o HLE cobre socket(97), connect(98), read/write e close;
+  - o endereco FreeBSD sockaddr_in e convertido para IPv4 textual e porta;
+  - nao foram adicionados TAP, WinSock direto ou imports desktop ao guest ABI.
+
+Mapeamento recomendado no aplicativo UWP:
+  - internetClient no manifesto quando INTERNET_CLIENT for concedido;
+  - privateNetworkClientServer somente quando PRIVATE_CLIENT for necessario;
+  - /data em LocalFolder/<TITLE_ID>/data;
+  - /temp e /temp0 em TemporaryFolder/<TITLE_ID>;
+  - /app0 e /download0 por StorageFolder/Broker autorizado e somente leitura
+    onde aplicavel;
+  - dialogos devem ser encaminhados para a UI thread e concluidos por ID.
+
+Teste funcional da Fase 7:
+  - executa um ELF guest real em TCG com title-id=TEST00001;
+  - valida escopo /titles/TEST00001 e bloqueio de escrita em /app0;
+  - valida seek, stat/fstat, flush, mkdir, readdir, rename e unlink;
+  - valida save atomico byte a byte e cleanup dos dois mounts temporarios;
+  - valida request/response de /dev/dialog;
+  - valida socket publico, send/recv e bloqueio de 192.168.1.2 sem capability;
+  - passa com audiodev none e audiodev xaudio2.
+
+Recompilacao:
+
+  $env:HOME=(Resolve-Path .\build-shadps4-check).Path
+  $env:CHERE_INVOKING='1'
+  $env:MSYSTEM='UCRT64'
+  C:\msys64\usr\bin\bash.exe --noprofile --norc -c `
+    'export PATH=/ucrt64/bin:/usr/bin; cd build-shadps4-check; `
+    ninja qemu-system-shadps4.dll'
+
+  C:\msys64\ucrt64\bin\strip.exe --strip-unneeded `
+    build-shadps4-check\qemu-system-shadps4.dll
+
+Validacao:
+
+  C:\msys64\ucrt64\bin\python.exe tests\shadps4\test_loader.py `
+    build-shadps4-check\qemu-system-shadps4.dll
+
+  $env:SHADPS4_TEST_AUDIODEV='xaudio2'
+  C:\msys64\ucrt64\bin\python.exe tests\shadps4\test_loader.py `
+    build-shadps4-check\qemu-system-shadps4.dll
+
+DLL stripada validada em 13/07/2026:
+  - tamanho: 7.392.851 bytes;
+  - SHA-256:
+    21D7675EA4866934DEA32700F732F719C7A7601FC9EF4E64D95842EFA835D0E0;
+  - os quatro novos exports de storage/dialog/rede permanecem presentes;
+  - qemu_host_start_with_args permanece ausente;
+  - nenhum caminho local de source/build permanece nas strings da DLL;
+  - testes none e xaudio2: PASS.
+
+
+36. PERFIS DE HARDWARE PS4 BASE E PS4 PRO
+==========================================
+
+Decisoes consolidadas:
+  - nome comercial/tecnico base: PS4 (Liverpool/base);
+  - nome comercial/tecnico aprimorado: PS4 Pro (Neo);
+  - CPU guest executada por TCG como caminho principal;
+  - acelerador nativo permanece opcional quando estiver disponivel no host;
+  - modelo CPU exposto: AMD Jaguar, 8 nucleos;
+  - variantes iniciais no mesmo target/DLL: base e neo.
+
+Interface da maquina:
+  - -M shadps4,variant=base seleciona PS4 Liverpool/base;
+  - -M shadps4,variant=neo seleciona PS4 Pro Neo;
+  - base e o valor padrao para preservar compatibilidade;
+  - qualquer outro valor e rejeitado durante configuracao;
+  - a maquina exige exatamente 8 CPUs e nao aceita uma topologia reduzida;
+  - o target continua x86_64-shadps4-softmmu e nao foi duplicado por variante.
+
+Perfil CPUID Jaguar:
+  - vendor AuthenticAMD;
+  - Family 16h, Model 00h, Stepping 1;
+  - model-id distingue Liverpool e Neo;
+  - topologia: um package, oito cores e uma thread por core;
+  - extensoes habilitadas incluem SSSE3, SSE4.1, SSE4.2, SSE4a, AVX, AES,
+    XSAVE, PCLMULQDQ, MOVBE, POPCNT, F16C, ABM e BMI1;
+  - o perfil evita usar o vendor Intel herdado do qemu64.
+
+Execucao:
+  - recomendado atualmente: -accel tcg,thread=single;
+  - a maquina nao fixa o acelerador no codigo;
+  - quando um acelerador nativo compativel for habilitado no build/host, a
+    selecao continua sendo feita por -accel sem criar outra variante;
+  - o log identifica se a instancia usa TCG ou acelerador nativo.
+
+Cobertura:
+  - o ELF de teste executa CPUID dentro do guest;
+  - valida AuthenticAMD, Family 16h/Model 00h/Stepping 1 e oito processadores;
+  - o teste funcional usa variant=base;
+  - o teste de fault controlado inicializa variant=neo.
+
+
+37. AUDITORIA DE ROBUSTEZ DO QEMU-SYSTEM-SHADPS4
+=================================================
+
+Auditoria concluida em 13/07/2026.
+
+Bootstrap e maquina:
+  - removida a preparacao duplicada da CPU durante MachineClass::init;
+  - o processo guest agora e instalado somente pelo reset inicial do QEMU;
+  - cada boot registra uma unica mensagem "shadPS4 user CPU ready";
+  - CPUs continuam estacionadas se faltar kernel ou se o loader falhar;
+  - error_fatal foi removido da criacao dos CPUs e do dispositivo de I/O;
+  - falhas de propriedade, APIC ou realize agora retornam Error e deixam a
+    maquina inerte sem encerrar diretamente o processo UWP;
+  - calculos do fim da imagem e da area TLS passaram a detectar overflow.
+
+Loader ELF/SELF:
+  - PT_TLS agora exige filesz <= memsz e alinhamento zero ou potencia de dois;
+  - multiplos PT_TLS, PT_DYNAMIC ou PT_SCE_DYNLIBDATA sao rejeitados;
+  - relocalizacoes relativas e absolutas usam soma assinada verificada;
+  - overflow ou underflow em base, simbolo ou addend gera erro limpo;
+  - a busca da imagem TLS usa subtracao limitada, sem somar extremos de 64 bits.
+
+HLE e memoria:
+  - corrigida copia de scoped_path nao inicializado ao abrir /dev/*;
+  - read e write possuem limite simetrico de 16 MiB;
+  - write de console retorna apenas a quantidade realmente consumida;
+  - payload de dialogo distingue EINVAL de EFAULT e normaliza erros do host;
+  - mmap/munmap validam indices em 64 bits antes de converter para uint32_t;
+  - o primeiro reset nao executa cleanup de uma sessao HLE inexistente.
+
+GPU:
+  - parsing PM4 passou a ser transacional;
+  - registradores e parsed_packet_count so sao publicados ao fim do pacote;
+  - falha de leitura, opcode, tamanho ou fence nao incrementa submit_count;
+  - queue state e last_fence_value permanecem intactos em submissao rejeitada.
+
+Input e audio:
+  - movimento relativo satura em INT32_MIN/INT32_MAX, sem overflow assinado;
+  - sinks de gamepad, touch e motion validam indice e ponteiro internamente;
+  - erros dos sinks agora chegam ao retorno da API publica;
+  - AudioIn retorna ENOSPC quando a fila esta cheia;
+  - mudanca de formato de AudioIn descarta dados antigos para nao misturar PCM;
+  - AudioIn e AudioOut rejeitam buffers que nao contem frames PCM completos;
+  - reconfigurar AudioOut limpa a fila do formato anterior;
+  - falha ao abrir a voice do backend e propagada para o guest;
+  - consumo impossivel maior que o chunk e detectado no bridge de audio.
+
+Embedding e display:
+  - main_loop_step agora impede chamadas concorrentes e corrida com cleanup;
+  - start nao reinicia um main loop que ja terminou;
+  - main_loop_step apos exit devolve o status salvo sem reentrar no QEMU;
+  - cleanup limpa callbacks, filas, sinks e requests de dialogo pendentes;
+  - respostas de dialogo duplicadas ou sem request ativo retornam ENOENT;
+  - key number e qcode invalidos sao rejeitados antes de entrar no input core;
+  - mouse absoluto evita query de dispositivos quando ja esta capturado;
+  - formatos Pixman ARGB/XRGB/ABGR/XBGR deixaram de ser rotulados
+    incorretamente como BGRA/RGBA; a negociacao aceita apenas layouts exatos.
+
+Regressoes automatizadas adicionadas:
+  - PM4 parcialmente valido seguido de header invalido;
+  - fence em endereco guest inacessivel sem commit parcial;
+  - indices e teclas invalidos na API de host;
+  - frame AudioIn desalinhado;
+  - resposta de dialogo duplicada;
+  - PT_TLS com tamanho invalido, alinhamento invalido e header duplicado;
+  - relocalizacao assinada com underflow.
+
+Perfil minimo do build UWP:
+  - o comando de configure desta secao desativa backends desktop e protocolos
+    nao usados pela maquina hibrida;
+  - isso remove imports diretos de ncurses, Epoxy/OpenGL, GIO, GnuTLS, NFS,
+    SSH, Slirp, VNC, PNG/JPEG, bzip2, LZO e Zstd;
+  - gcrypt e nettle ficam desativados; hash/HMAC usam o fallback GLib;
+  - somente xaudio2 permanece na lista de drivers de audio.
+
+Validacao executada:
+  - compilacao completa da DLL: PASS;
+  - scripts/checkpatch.pl nos C/Python alterados: 0 erros, 0 warnings;
+  - teste funcional com audiodev none: PASS;
+  - teste funcional com audiodev xaudio2: PASS;
+  - PS4 Liverpool/base, PS4 Pro Neo, TCG, HLE, storage, dialogo, rede, GPU,
+    input, AudioIn/AudioOut e fault controlado cobertos.
+  - DLL antes do strip: 9.480.807 bytes;
+  - DLL depois de strip --strip-unneeded: 6.727.902 bytes;
+  - SHA-256 final:
+    52A28DB24BC4D59ABEA6B82B960D8600C674A9B4670E145672AC0C41BB55B3F3;
+  - exports qemu_host_init/start/step/shutdown/reset/join/cleanup e callbacks
+    permanecem presentes depois do strip;
+  - qemu_host_start_with_args e caminhos locais de source/build: ausentes.
+
+Limite de empacotamento UWP:
+  - a DLL principal nao importa registry, USER32, WINMM, OLE32, DirectSound,
+    CreateFiber ou ConvertThreadToFiber desktop;
+  - CreateFiberEx/ConvertThreadToFiberEx sao usados via API sets;
+  - o build MSYS2 ainda depende de runtime GCC, winpthread, GLib/GModule,
+    Pixman e zlib, alem dos API sets UCRT;
+  - todas essas DLLs transitivas precisam ser incluidas no pacote e auditadas;
+  - para certificacao estrita Store/Xbox, o passo definitivo continua sendo
+    compilar QEMU e dependencias com toolchain/CRT aceitos pelo Windows SDK e
+    validar o pacote inteiro com WACK. Auditar apenas qemu-system-shadps4.dll
+    nao prova compatibilidade UWP das dependencias transitivas.
+
+
+38. VALIDACAO COM O TITULO CUSA13032
+====================================
+
+Teste executado em 13/07/2026 com o pacote extraido em:
+
+  C:\Users\user1\Projetos\GameTest
+
+Identificacao:
+  - TITLE_ID: CUSA13032;
+  - TITLE: GUNDEMONIUMS;
+  - VERSION: 01.02;
+  - eboot.bin: SELF ET_SCE_DYNEXEC, descriptografado e nao comprimido;
+  - sce_module/libc.prx e sce_module/libSceFios2.prx: descriptografados;
+  - sce_sys/about/right.sprx: ainda criptografado.
+
+Correcao encontrada pelo teste real:
+  - o loader assumia que PT_DYNAMIC teria uma entrada SELF bloqueada com o
+    mesmo indice do program header;
+  - em SELF Orbis real, PT_DYNAMIC pode apontar para um intervalo interno ao
+    payload bloqueado de PT_SCE_DYNLIBDATA;
+  - a resolucao agora procura o p_offset/p_filesz solicitado dentro de todos
+    os program headers referenciados pelas entradas SELF bloqueadas;
+  - referencias fora do phnum, overflow, payload curto, criptografia e
+    compressao continuam sendo rejeitados;
+  - foi adicionado um SELF sintetico com PT_DYNAMIC no fim de
+    PT_SCE_DYNLIBDATA para cobrir essa organizacao na regressao automatizada.
+
+Resultado depois da correcao:
+  - entry virtual: 0x800068ab0;
+  - entry fisico: 0x01068ab0;
+  - image_size: 0x1b36db4;
+  - 3 regioes carregaveis;
+  - 333 simbolos;
+  - 2468 relocalizacoes;
+  - 2047 relocalizacoes aplicadas;
+  - 421 relocalizacoes de imports permanecem sem resolucao.
+  - a suite funcional completa passou novamente sobre a DLL apos
+    strip --strip-unneeded.
+
+Dependencias declaradas pelo eboot:
+  - 29 modulos importados;
+  - maiores grupos: libSceGnmDriver (97 simbolos), libc (79), libkernel (34)
+    e libSceFios2 (25);
+  - o pacote fornece somente libc.prx e libSceFios2.prx entre esses grupos;
+  - os demais incluem VideoOut, AudioOut, Pad, Ngs2, Sysmodule, UserService,
+    SaveData, dialogs, RTC, PNG/JPEG e servicos NP.
+
+Conclusao funcional:
+  - o SELF principal agora passa integralmente pelo parser e pelo loader;
+  - a CPU nao deve entrar no entry point enquanto houver imports fortes sem
+    resolucao;
+  - executar este titulo requer carregamento/link de PRX, resolucao por NID e
+    exports HLE com semantica real para kernel, GnmDriver, VideoOut, audio,
+    pad e demais bibliotecas;
+  - preencher imports com stubs genericos que apenas retornam zero mascara o
+    erro e nao constitui suporte funcional ao jogo.
+
+
+39. VALIDACAO COM O TITULO CUSA02456
+====================================
+
+Teste executado em 13/07/2026 com o pacote extraido em:
+
+  C:\Users\user1\Projetos\CUSA02456
+
+Identificacao:
+  - TITLE_ID: CUSA02456;
+  - TITLE: Aces of the Luftwaffe;
+  - VERSION: 01.01;
+  - SDK declarado: 02.00;
+  - eboot.bin: SELF ET_SCE_DYNEXEC, descriptografado e nao comprimido;
+  - sce_module/libc.prx e sce_module/libSceFios2.prx: descriptografados;
+  - sce_sys/about/right.sprx: todos os oito segmentos criptografados.
+
+Resultado do eboot.bin no loader:
+  - entry virtual: 0x80023c9b0;
+  - entry fisico: 0x0123c9b0;
+  - image_size: 0x7864c8;
+  - 2 regioes carregaveis;
+  - 327 simbolos;
+  - 2456 relocalizacoes;
+  - 2079 relocalizacoes aplicadas;
+  - 377 referencias de imports permanecem sem resolucao;
+  - essas referencias representam 325 simbolos importados distintos.
+
+Maiores grupos de referencias pendentes:
+  - libc: 186;
+  - libSceGnmDriver: 50;
+  - libSceNet: 30;
+  - libkernel: 21;
+  - libSceHttp: 20;
+  - libScePosix via libkernel: 10;
+  - libScePad: 8;
+  - libSceSaveData e libSceSaveDataDialog: 7 cada;
+  - libSceAudioOut e libSceMsgDialog: 6 cada;
+  - tambem existem imports de VideoOut, AudioIn, SSL, dialogs, Sysmodule,
+    UserService, ScreenShot, SystemService e VideoRecording.
+
+PRX fornecidos pelo titulo:
+  - libc.prx carrega estruturalmente, possui 2221 simbolos, aproximadamente
+    2140 exports e 80 relocalizacoes externas pendentes;
+  - seus exports resolvem as 186 referencias de libc usadas pelo eboot;
+  - libSceFios2.prx carrega estruturalmente, possui 250 simbolos,
+    aproximadamente 165 exports e 82 relocalizacoes externas pendentes;
+  - ambos ainda dependem de libkernel e outras bibliotecas do sistema;
+  - carregar os PRX isoladamente nao basta: a alocacao de bases, registro de
+    exports, resolucao NID entre modulos, TLS por modulo e ordem de init devem
+    ser tratados por um linker de modulos unico.
+
+Conclusao:
+  - nenhuma nova falha de formato SELF/ELF foi encontrada neste titulo;
+  - o resolvedor corrigido para PT_DYNAMIC/PT_SCE_DYNLIBDATA aceitou eboot,
+    libc e Fios2 sem regressao;
+  - este caso reforca que a proxima etapa funcional deve ser o linker de PRX
+    e NID, seguido das bibliotecas HLE prioritarias;
+  - para este jogo, a ordem inicial de prioridade e libc/libkernel,
+    GnmDriver, Net/HTTP, Pad, VideoOut, SaveData/dialogs e audio.
+
+
+40. LINKER PRX/NID, TLS MULTIMODULO E EXPORTS HLE
+=================================================
+
+Implementacao concluida em 13/07/2026, usando o linker do shadPS4 como
+referencia de comportamento.
+
+Arquivos principais:
+  - hw/i386/shadps4-loader.h;
+  - hw/i386/shadps4-loader.c;
+  - hw/i386/shadps4.c;
+  - hw/i386/shadps4-hle.h;
+  - hw/i386/shadps4-hle.c;
+  - tests/shadps4/test_loader.py;
+  - tests/shadps4/README.txt.
+
+Modelo implementado:
+  1. O eboot e carregado primeiro na base virtual 0x800000000.
+  2. Os arquivos .prx e .sprx de sce_module sao enumerados em ordem
+     deterministica.
+  3. Cada PRX recebe base virtual e fisica propria, alinhada a 2 MiB.
+  4. Todos os modulos sao analisados antes da segunda passagem do linker.
+  5. Imports e exports usam a identidade completa NID, biblioteca, versao da
+     biblioteca, modulo e tipo ELF.
+  6. R_X86_64_64, GLOB_DAT e JUMP_SLOT externos ficam pendentes ate todos os
+     providers estarem registrados.
+  7. A segunda passagem escreve o endereco virtual do export encontrado e
+     preserva o addend de R_X86_64_64.
+  8. Imports fortes sem provider continuam pendentes e impedem execute=on.
+     Nao existe fallback generico que retorne zero.
+
+TLS:
+  - somente imagens com PT_TLS recebem modid;
+  - o eboot usa o primeiro modid quando possui TLS;
+  - PRX TLS recebem IDs consecutivos;
+  - cada template TLS e copiado para uma area estatica separada;
+  - o DTV contem uma entrada por modid e a contagem do maior ID valido;
+  - R_X86_64_DTPMOD64 grava o modid da imagem dona da relocacao;
+  - __tls_get_addr usa o par {modulo, offset}, valida limites e retorna um
+    endereco virtual guest;
+  - imagens sem PT_TLS zeram o ID provisoriamente recebido pelo loader.
+
+Exports HLE:
+  - o provider HLE e uma imagem sintetica somente de codigo guest;
+  - cada export ocupa um trampoline x86-64 de 16 bytes;
+  - o trampoline adapta RCX para R10, seleciona o dispatcher por EAX, executa
+    SYSCALL e retorna ao chamador;
+  - nenhum ponteiro de funcao do processo host e gravado no guest TCG;
+  - foram registrados aliases confirmados nos LIB_FUNCTION do shadPS4 para
+    arquivo, diretorio, mmap/munmap POSIX, equeue POSIX, rede, relogios, TLS,
+    identificacao base/Neo e versao do SDK;
+  - aliases sceKernel so foram adicionados quando a ABI podia usar uma
+    implementacao existente. sceKernelMmap, por exemplo, nao foi ligado ao
+    mmap POSIX porque possui sete argumentos e parametro de saida.
+
+Procparam:
+  - PT_SCE_PROCPARAM e reconhecido e deve estar dentro de dados carregados;
+  - tamanho minimo, intervalo e versao SDK sao validados;
+  - sceKernelGetCompiledSdkVersion usa o sdk_version do procparam;
+  - sceKernelGetProcParam retorna o endereco virtual guest original.
+
+Regressoes sinteticas adicionadas:
+  - eboot importando funcao de uma PRX em base isolada;
+  - importacao NID de sceKernelGetTscFrequency resolvida para HLE e executada
+    pelo TCG, com retorno esperado de 1000000000;
+  - eboot TLS modid 1 e PRX TLS modid 2;
+  - R_X86_64_DTPMOD64 dentro da PRX;
+  - chamada de __tls_get_addr para a PRX e verificacao do byte inicializado;
+  - todos os testes anteriores de ELF, SELF, MMU, HLE, GPU, IO e embedding.
+
+Resultado atual dos titulos reais, contando eboot e dependencias dos PRX:
+  - GameTest/CUSA13032: libc.prx e libSceFios2.prx carregados em bases
+    separadas, TLS IDs 2 e 3, 2243 de 2468 relocacoes do eboot aplicadas e
+    365 relocacoes totais ainda pendentes;
+  - CUSA02456: libc.prx e libSceFios2.prx carregados em bases separadas,
+    TLS IDs 2 e 3, 2272 de 2456 relocacoes do eboot aplicadas e 310
+    relocacoes totais ainda pendentes.
+
+Como repetir:
+  1. Configure o target shadps4 e gere build-shadps4-check conforme as
+     secoes anteriores.
+  2. Execute:
+       ninja -C build-shadps4-check qemu-system-shadps4.dll
+  3. Execute a regressao:
+       C:\msys64\ucrt64\bin\python.exe tests\shadps4\test_loader.py ^
+         build-shadps4-check\qemu-system-shadps4.dll
+  4. Valide um titulo sem iniciar codigo incompleto usando a API de embedding
+     com -M shadps4,execute=on, -kernel <eboot.bin> e request_shutdown antes
+     do primeiro passo do loop. O loader deve listar os PRX e recusar a
+     execucao enquanto houver relocacoes fortes pendentes.
+  5. No artefato de distribuicao, execute por ultimo:
+       strip --strip-unneeded build-shadps4-check\qemu-system-shadps4.dll
+  6. Repita a regressao depois do strip.
+
+Artefato validado em 13/07/2026:
+  - build-shadps4-check\qemu-system-shadps4.dll;
+  - tamanho antes do strip: 9494565 bytes;
+  - tamanho depois do strip: 6740463 bytes;
+  - SHA-256: 4EC7A52FD47976FE6D62AF1A75CF957D497CDB08EF2C97B22224707599FFB485;
+  - suite completa aprovada depois do strip.
+
+Proxima frente funcional:
+  - implementar providers HLE reais para os imports restantes, priorizando
+    GnmDriver, VideoOut, Pad, AudioOut, Net/HTTP, SaveData e dialogs;
+  - manter registro por NID e ABI individual, sem stubs universais;
+  - acrescentar testes guest para cada ABI antes de liberar o respectivo NID.
+
+
+41. HLE DE VIDEO, INPUT, AUDIO, GNM, REDE, SAVEDATA E DIALOGS
+=============================================================
+
+Implementacao concluida em 13/07/2026, comparando NIDs, assinaturas e estados
+com C:\Users\user1\Projetos\shadPS4.
+
+Arquivos alterados:
+  - hw/i386/shadps4.c;
+  - hw/i386/shadps4-hle.h;
+  - hw/i386/shadps4-hle.c;
+  - hw/i386/shadps4-gpu.h;
+  - hw/i386/shadps4-gpu.c.
+
+VideoOut:
+  - open/close, atributos de buffer, registro de buffers, flip rate, status,
+    evento de flip e submit de flip;
+  - enderecos e metadados guest sao validados antes do callback de video;
+  - o framebuffer registrado preserva largura, altura, pitch e formato.
+
+Pad:
+  - initialize, open, close, read, vibration, light bar, motion state e
+    controller info;
+  - estado do host e convertido para OrbisPadData, incluindo sticks,
+    gatilhos, touch, movimento e timestamp;
+  - saidas de vibracao/luz usam o callback publico do host.
+
+AudioOut/AudioIn:
+  - portas logicas independentes, formatos, canais, frames, volume, output,
+    outputs em lote e input;
+  - audio passa pelo backend de IO/XAudio2 ja registrado;
+  - tamanhos e formatos guest sao validados antes de copiar amostras.
+
+GnmDriver e GPU Liverpool nula:
+  - submit, submit+flip, variantes workload, submit done e submit allowed;
+  - MapComputeQueue/WithPriority, UnmapComputeQueue e DingDong com ate 64
+    filas, ring circular, read pointer guest e validacao de alinhamento;
+  - o limite de command buffer passou a 0xfffff DWORDs;
+  - o parser valida framing de todos os pacotes PM4 type 3, preserva parsing
+    de SET_CONTEXT_REG/SET_SH_REG/WRITE_DATA e aceita draw/dispatch/cache/sync
+    que o backend nulo nao executa;
+  - imports Gnm presentes no titulo sao adicionados ao provider HLE com NID,
+    biblioteca e modulo exatos;
+  - construtores ainda sem traducao grafica emitem um NOP PM4 valido cobrindo
+    o buffer. Inicializadores retornam a quantidade de DWORDs; consultas nao
+    sao tratadas como buffers e nao sobrescrevem memoria;
+  - esta camada permite link e validacao de command streams, mas ainda nao e
+    um renderer 3D. Draw/dispatch nao produzem imagem sem um backend Liverpool
+    que traduza shaders, recursos e PM4 para a API grafica do host.
+
+Net, HTTP e SSL:
+  - socket cliente, connect, send, recv, close e htons usam callbacks do host;
+  - pools, epoll, errno TLS, inet_pton/inet_ntop e resolver possuem handles e
+    validacao de ciclo de vida;
+  - bind/listen/accept/sendto/recvfrom, DNS e opcoes sem callback equivalente
+    retornam ENOSYS, sem sucesso falso;
+  - HTTP implementa contextos, templates, conexoes, requests, headers,
+    nonblock e epoll; destruicao de pai invalida filhos recursivamente;
+  - envio HTTP, resposta e TLS retornam ENOSYS enquanto a API publica do host
+    nao oferecer transporte HTTP/TLS. O import e ligado, mas o erro explicito
+    permite ao jogo seguir seu caminho offline.
+
+SaveData:
+  - Initialize/2/3, Terminate, Mount, Mount2, Umount, SetParam,
+    GetMountInfo, Delete, DirNameSearch e GetEventResult;
+  - /savedata0 e isolado em /titles/<TITLE_ID>/savedata/<DIR>;
+  - nomes com separadores ou traversal sao rejeitados;
+  - SaveData Memory 2 implementa Setup/Get/Set persistentes por slot em
+    memory<slot>.bin, com offset, limite de 64 MiB e extensao segura do arquivo;
+  - diretorios existentes aceitam EEXIST e arquivos nunca escapam do sandbox.
+
+Dialogs:
+  - MsgDialog, SaveDataDialog, ImeDialog e ErrorDialog possuem init/open,
+    polling, result, close/abort e terminate conforme os NIDs usados;
+  - CommonDialogInitialize e progress update foram registrados;
+  - requests e respostas passam pelos callbacks publicos do host;
+  - resultados respeitam os layouts diferentes de Msg, SaveData e IME.
+
+Resultado nos titulos reais:
+  - GameTest/CUSA13032: pendencias totais de 365 para 231;
+  - CUSA02456: pendencias totais de 310 para 161;
+  - nenhuma pendencia restante em GnmDriver, VideoOut, Pad, AudioOut,
+    AudioIn, Net, HTTP, SSL, SaveData, MsgDialog, SaveDataDialog, ImeDialog,
+    ErrorDialog ou CommonDialog para esses dois titulos;
+  - pendencias restantes pertencem principalmente a libkernel,
+    libSceLibcInternal, Np, Ngs2, Audiodec, Sysmodule e UserService.
+
+Como repetir:
+  1. Entre no shell MSYS2 UCRT64 ou coloque /ucrt64/bin e /usr/bin no PATH.
+  2. Recompile:
+       ninja -C build-shadps4-check qemu-system-shadps4.dll
+  3. Execute a regressao completa:
+       C:\msys64\ucrt64\bin\python.exe tests\shadps4\test_loader.py ^
+         build-shadps4-check\qemu-system-shadps4.dll
+  4. Carregue cada eboot com execute=on e solicite shutdown antes do primeiro
+     passo para auditar relocacoes sem executar imports fortes pendentes.
+  5. Gere o artefato final somente depois dos testes:
+       C:\msys64\ucrt64\bin\strip.exe --strip-unneeded ^
+         build-shadps4-check\qemu-system-shadps4.dll
+  6. Repita a regressao completa na DLL stripped.
+
+Regras mantidas:
+  - qemu_host_start_with_args nao existe e nao deve ser usado;
+  - a API de embedding existente continua sendo o ponto de entrada;
+  - o strip ocorre apenas depois do link e dos testes;
+  - nao distribuir .a, .o/.obj, PDB, Meson logs ou o diretorio de build.
+
+Artefato validado:
+  - build-shadps4-check\qemu-system-shadps4.dll;
+  - tamanho antes do strip: 9524195 bytes;
+  - tamanho depois do strip: 6768691 bytes;
+  - SHA-256: 4EE89FE54B108E328E28204C9F009F8B1DC3205445D59D05BB1DF9DBF54B8357;
+  - suite Phase 7 aprovada novamente depois do strip;
+  - exports qemu_host_init, qemu_host_start, qemu_host_main_loop_step e
+    qemu_host_register_video_callback confirmados;
+  - qemu_host_start_with_args ausente do codigo e da DLL.
+
+
+42. HLE DE USERSERVICE, SYSTEMSERVICE E SYSMODULE
+=================================================
+
+Implementacao concluida em 14/07/2026 como primeiro bloco da proxima etapa
+de compatibilidade geral, sem limitar os NIDs aos dois jogos de teste.
+
+UserService:
+  - sceUserServiceInitialize e sceUserServiceTerminate mantem o estado do
+    servico e preservam o comportamento idempotente atual do shadPS4;
+  - sceUserServiceGetInitialUser retorna o usuario padrao 1;
+  - sceUserServiceGetLoginUserIdList retorna quatro slots: usuario 1 seguido
+    por tres IDs invalidos (-1);
+  - ponteiros nulos retornam ORBIS_USER_SERVICE_ERROR_INVALID_ARGUMENT.
+
+SystemService:
+  - sceSystemServiceGetStatus escreve o layout ABI de 12 bytes, com CPU mode
+    normal ativo e os demais estados desativados;
+  - sceSystemServiceParamGetInt cobre idioma, formatos de data/hora, fuso,
+    horario de verao, controle parental e botao de confirmacao;
+  - os valores padrao seguem o shadPS4: ingles US, DD/MM/YYYY, 24 horas,
+    UTC+02:00, horario de verao ativo, parental off e Cross para confirmar;
+  - sceSystemServiceHideSplashScreen atualiza o estado interno sem depender
+    de uma janela desktop.
+
+Sysmodule:
+  - LoadModule, UnloadModule e IsLoaded usam contagem de referencias por ID;
+  - LoadModuleInternalWithArg valida o argumento desconhecido, escreve
+    res_out e desfaz a carga se o ponteiro guest for invalido;
+  - IDs validos e lacunas seguem a tabela de 310 entradas do shadPS4, cujo
+    maior ID e 313;
+  - modulos de debug sao rejeitados no perfil retail e as restricoes dos IDs
+    0x80, 0xb0 e 0xb8 respeitam a versao de SDK compilada;
+  - IDs ausentes retornam ORBIS_SYSMODULE_INVALID_ID e unload/isLoaded de um
+    modulo sem carga retornam ORBIS_SYSMODULE_NOT_LOADED.
+
+NIDs adicionados:
+  - UserService: j3YMu1MVNNo, bwFjS+bX9mA, CdWp0oHWGr0, fPhymKNvK-A;
+  - SystemService: rPo6tV8D9bM, fZo48un7LK4, Vo5V8KAwCmk;
+  - Sysmodule: g8cM39EUZ6o, eR2bZFAAU0Q, fMP5NHUOaMk, hHrGoGoNf+s.
+
+Validacao:
+  - a suite gera ELFs sinteticos para as tres bibliotecas;
+  - UserService e SystemService validam o retorno e os dados escritos na
+    memoria guest; Sysmodule valida a carga de um ID real;
+  - comando: python tests\shadps4\test_loader.py ^
+      build-shadps4-check\qemu-system-shadps4.dll
+  - resultado desta etapa: shadPS4 Phase 7 loader/HLE/TCG test: PASS.
+  - DLL final validada depois de strip --strip-unneeded:
+      tamanho 6770227 bytes;
+      SHA-256 09C7D4E972AA412ADF43CEBA07FF91E6BA157A214938657E240C494FDD72BEDF;
+      qemu_host_init, qemu_host_start, qemu_host_main_loop_step e
+      qemu_host_register_video_callback presentes;
+      qemu_host_start_with_args ausente.
+
+
+43. LIBKERNEL SEM LACUNAS - PARTE 1
+===================================
+
+Iniciada em 14/07/2026. O escopo global foi extraido diretamente dos
+LIB_FUNCTION/LIB_OBJ do shadPS4, sem limitar a implementacao aos jogos usados
+na regressao:
+  - catalogo de referencia: 436 NIDs unicos de libkernel;
+  - cobertura anterior: 49;
+  - cobertura depois desta parte: 77;
+  - pendencias ainda nao publicadas pelo provider: 359.
+
+Regra de implementacao:
+  - nenhum NID pendente e ligado a um stub universal de sucesso;
+  - uma familia so entra no provider quando possui estado, validacao de ABI,
+    erros coerentes e teste guest;
+  - simbolos ainda nao implementados permanecem unresolved de forma visivel.
+
+Provider de objetos:
+  - o provider HLE passou a distinguir STT_FUNC de STT_OBJECT;
+  - objetos sao gravados em memoria guest editavel e relocados pelo mesmo
+    linker usado pelos PRX;
+  - implementados f7uOxY9mM1U (__stack_chk_guard), +2thxYZ4syk (environ),
+    djxxOmW6-aw (progname) e nQVWJEGHObc (sigintr);
+  - environ aponta para um vetor guest terminado em NULL, progname aponta
+    para "eboot.bin", o canario usa 0xDEADBEEF54321ABC e sigintr possui o
+    layout de 16 bytes do Sigset.
+
+Fundamentos de libkernel:
+  - sceKernelError, __Error TLS, stack_chk_fail, getpagesize, getargc,
+    getargv, _sigprocmask, sched_yield e getpid;
+  - __Error retorna armazenamento por thread dentro do TLS guest;
+  - getargv aponta para o argv real criado na pilha inicial;
+  - stack_chk_fail solicita shutdown por guest panic, sem abortar o host.
+
+Equeue completa:
+  - create/delete/wait;
+  - add/trigger/delete de User e UserEdge;
+  - add/delete de Timer e HRTimer;
+  - get id/filter/data/user-data;
+  - ate 16 filas com 32 eventos cada, handles s64, deadlines no relogio
+    virtual, eventos one-shot e erros Orbis de EBADF, EFAULT, EINVAL,
+    ENOENT, ENOMEM, ENAMETOOLONG e ETIMEDOUT;
+  - a espera vazia retorna ETIMEDOUT para nunca bloquear a thread do host.
+
+Testes adicionados:
+  - ELF STT_OBJECT reloca e le o canario de 64 bits;
+  - ELF de Equeue chama sceKernelCreateEqueue e valida o handle 0x100
+    escrito na memoria guest;
+  - suite completa Phase 7 aprovada depois das alteracoes.
+
+Impacto medido nos titulos, incluindo esta parte e a parte 42:
+  - GameTest/CUSA13032: 231 para 201 relocations pendentes;
+  - CUSA02456: 161 para 135 relocations pendentes.
+
+Ordem das proximas partes de libkernel, sem saltar familias:
+  1. pthread attributes, mutex, condvar, rwlock e TLS keys;
+  2. criacao/join/exit de threads e callbacks guest;
+  3. memoria direta/flexivel, protecao e consultas;
+  4. filesystem vetorizado, pread/pwrite e AIO;
+  5. processo, modulos, sinais, tempo e semaforos;
+  6. auditoria final dos 436 NIDs e teste de cobertura zero-gap.
+
+Artefato desta parte:
+  - build-shadps4-check\qemu-system-shadps4.dll;
+  - strip --strip-unneeded aplicado;
+  - tamanho: 6774835 bytes;
+  - SHA-256: 9D089106BA1745742F958190E6DAEADD37930F94CBCDBDAC68A3C5CDDCF32CB0;
+  - suite completa aprovada novamente depois do strip.
+
+
+44. LIBCINTERNAL, HTTP2, NETCTL, NGS2, AJM E AVPLAYER
+=====================================================
+
+Implementado em 14/07/2026 tomando o shadPS4 como referencia de NIDs,
+assinaturas e layouts. O provider HLE agora sintetiza exports para imports
+dos modulos libSceLibcInternal, libSceHttp2, libSceNetCtl, libSceNgs2,
+libSceAjm e libSceAvPlayer, alem do caminho de compatibilidade Gnm existente.
+NIDs desconhecidos desses modulos sao resolvidos para um erro ENOSYS
+especifico da familia, nunca para sucesso universal.
+
+libSceLibcInternal:
+  - memcpy, memcpy_s, memset, memcmp, strlen, strcmp, strncmp, strchr,
+    strncpy, strcat, strcpy_s, strcat_s e strncpy_s operam na memoria guest;
+  - sin/cos/tan, inversas, exp/exp2, pow, log/log10 e sincos cobrem double e
+    float, lendo e devolvendo valores nos registradores XMM da ABI SysV;
+  - os quatro helpers de mutex possuem handles validados e estado proprio;
+  - fflush e neutro porque o HLE nao mantem FILE buffers do CRT;
+  - imports STT_OBJECT de LibcInternal agora permanecem objetos gravaveis de
+    dados, em vez de serem transformados incorretamente em trampolins.
+
+libSceNetCtl:
+  - Init/Term, GetState, GetResult, GetInfo, GetNatInfo, registro/remocao de
+    ate oito callbacks e CheckCallback;
+  - GetInfo fornece interface wired, MTU 1500, loopback, mascara, rota, DNS
+    e proxy desativado, com validacao de estado e ponteiros guest;
+  - funcoes IPC/AP/BWE ainda nao modeladas retornam ENOSYS explicitamente.
+
+libSceHttp2:
+  - contextos, templates e requests usam a arvore de handles HTTP existente;
+  - create/delete, headers, abort e setters validam o tipo do objeto;
+  - Send/Read/status/headers de resposta retornam ENOSYS enquanto nao houver
+    callback de transporte HTTP no host. Nenhuma requisicao e fingida.
+
+libSceAjm:
+  - contextos, registro de modulos, instancias por codec, destruicao,
+    consulta de codec e registro de memoria possuem estado e validacao;
+  - batches/decode MP3, AAC e ATRAC9 retornam ENOSYS enquanto nao houver um
+    backend de codec UWP-safe; nao sao marcados como concluidos sem decodificar.
+
+libSceNgs2:
+  - handles de system e rack, parentesco, destroy, userData e lock/unlock;
+  - QueryBufferSize produz o layout ContextBufferInfo e Render valida todos
+    os buffers e escreve silencio, comportamento correto para grafo vazio;
+  - vozes, streams, comandos DSP, FFT, geometria e codecs permanecem ENOSYS.
+
+libSceAvPlayer:
+  - Init/InitEx/Close, AddSource/AddSourceEx, tempo, looping, stream options,
+    pause/resume/stop e consultas sem frame possuem handles e estado;
+  - Start retorna ENOSYS enquanto nao existir demux/decode UWP-safe, mantendo
+    IsActive falso. Isso evita declarar playback funcional sem produzir A/V.
+
+Linker e testes:
+  - o linker coleta imports desses seis modulos e preserva NID, library,
+    module e tipo ELF;
+  - foram adicionados ELFs sinteticos que importam e chamam uma funcao de
+    cada modulo, todos com relocations unresolved=0;
+  - foi adicionado teste STT_OBJECT dinamico de LibcInternal;
+  - comando: python tests\shadps4\test_loader.py ^
+      build-shadps4-check\qemu-system-shadps4.dll
+  - resultado: shadPS4 Phase 7 loader/HLE/TCG test: PASS.
+
+Para repetir:
+  1. configurar/usar o diretorio build-shadps4-check para o target
+     x86_64-shadps4-softmmu;
+  2. executar ninja -C build-shadps4-check qemu-system-shadps4.dll;
+  3. executar a suite tests\shadps4\test_loader.py;
+  4. executar strip --strip-unneeded na DLL;
+  5. repetir a suite na DLL stripped e registrar tamanho/SHA-256.
+
+Artefato desta etapa:
+  - build-shadps4-check\qemu-system-shadps4.dll;
+  - strip --strip-unneeded aplicado;
+  - tamanho: 6791265 bytes;
+  - SHA-256: D36BC095124FD571760D62EA173ED3A034994AF57B8D4EE7BF10554ABECF5D7C;
+  - suite completa aprovada depois do strip;
+  - qemu_host_start_with_args continua ausente dos exports.
+
+
+45. COBERTURA COMPLETA DE LIBKERNEL E DEPENDENCIAS
+==================================================
+
+Implementado em 14/07/2026. A tabela dinamica de compatibilidade de
+libkernel foi comparada com todos os LIB_FUNCTION/LIB_OBJ registrados no
+diretorio core/libraries/kernel do shadPS4 usado como referencia.
+
+Cobertura de NIDs:
+  - 436 de 436 NIDs modernos da referencia possuem provider HLE;
+  - 18 NIDs legados adicionais encontrados em GameTest, CUSA02456,
+    libSceFios2.prx e libc.prx tambem foram adicionados;
+  - NID libkernel desconhecido continua sem provider. Nao existe fallback
+    universal de sucesso, portanto lacunas futuras permanecem visiveis;
+  - o loader agora lista NID, library, module e tipo ELF de cada relocation
+    ainda pendente antes de recusar o boot.
+
+Familias implementadas nesta etapa:
+  - atributos pthread, mutex/condvar/rwlock, semaforos POSIX e kernel,
+    pthread keys, event flags e estado observavel de pthreads;
+  - readv/writev, pread/pwrite, preadv/pwritev, rmdir, ftruncate parcial,
+    getdents, reachability e select nao bloqueante;
+  - nanosleep/usleep/sleep, clock_getres, ReadTsc, timezone e conversoes UTC;
+  - memoria direta/flexivel, reserve/map/unmap/protect, consultas, PRT,
+    batch/no-op validado e memory-pool com erro explicito quando indisponivel;
+  - AIO sincrono com requests, IDs, resultados, poll/wait/cancel/delete;
+  - signal sets, sigaction/signal, mascara, handlers e alt stack;
+  - firmware/SDK, auth/app info, workaround bits, UUID, sysconf, debug text,
+    ioctl, process mode, getrusage e lista de modulos vazia coerente;
+  - ABI HLE estendida para ler o setimo argumento SysV em RSP+8, necessario
+    para sceKernelMmap e outras funcoes com mais de seis argumentos.
+
+Comportamentos deliberadamente limitados:
+  - pthread_create cria estado/handle e join/detach funcionam sem bloquear,
+    mas a rotina guest ainda nao e executada em um segundo contexto TCG;
+  - once registra conclusao, mas ainda nao faz uma chamada guest aninhada;
+  - truncate por caminho e reducao via ftruncate retornam ENOSYS porque o
+    contrato QemuHostStorageCallbacks v2 nao oferece callback truncate;
+  - bind/listen/accept/socketpair/get/setsockopt/sendto/recvfrom retornam
+    ENOSYS porque os callbacks de rede do host ainda nao expõem tais operacoes;
+  - load/unload/dlsym/module-info dinamicos retornam ENOENT; integrar isso
+    exige expor o symbol resolver e a lista de imagens ao estado HLE;
+  - setcontext/sigreturn e entrega assíncrona de sinais guest ainda nao
+    restauram contexto de CPU;
+  - memory pools nao possuem backing independente e retornam ENOMEM;
+  - espera sem evento pronto retorna timeout/busy para nunca bloquear a UI.
+
+Validacao:
+  - testes sinteticos adicionados para firmware, memoria flexivel, event
+    flag, AIO e sigemptyset, alem dos testes anteriores de pthread/sync;
+  - tests\shadps4\test_loader.py passa integralmente;
+  - GameTest nao possui mais relocation pendente de libkernel; as pendencias
+    restantes pertencem a Ult, NP, RTC, Screenshot, Audiodec e DiscMap;
+  - CUSA02456 tambem foi auditado, incluindo tres NIDs legados exclusivos.
+
+Como repetir:
+  1. ninja -C build-shadps4-check qemu-system-shadps4.dll
+  2. python tests\shadps4\test_loader.py ^
+       build-shadps4-check\qemu-system-shadps4.dll
+  3. executar os eboot.bin pelo worker para auditar imports reais;
+  4. strip --strip-unneeded build-shadps4-check\qemu-system-shadps4.dll
+  5. repetir a suite completa depois do strip e calcular o SHA-256.
+
+Artefato final desta etapa:
+  - build-shadps4-check\qemu-system-shadps4.dll;
+  - strip --strip-unneeded aplicado;
+  - tamanho: 6821473 bytes;
+  - SHA-256: 8B3588E7FCC438314D968C7D8E281892487794F90ED5EC3BC2D1B8B47D098197;
+  - suite completa aprovada depois do strip;
+  - exports confirmados: qemu_host_init e qemu_host_start;
+  - qemu_host_start_with_args ausente, conforme requisito do projeto.
+
+
+46. USERSERVICE, SYSTEMSERVICE E SYSMODULE
+==========================================
+
+Implementado em 14/07/2026, usando os registros atuais do shadPS4 como
+referencia. A cobertura do resolver inclui 423 NIDs unicos de UserService,
+469 de SystemService e os 16 exports de Sysmodule, totalizando 908 NIDs.
+NIDs que a propria referencia implementa como stub retornam sucesso neutro
+somente quando o campo module do import identifica uma dessas bibliotecas;
+nao foi criado fallback global para outros modulos.
+
+libSceUserService:
+  - Initialize/Terminate mantem estado e Initialize publica um evento Login;
+  - GetEvent consome uma fila limitada e retorna NO_EVENT quando vazia;
+  - GetInitialUser, GetLoginUserIdList e GetRegisteredUserIdList apresentam
+    um usuario local estavel, ID 1, preenchendo vagas restantes com -1;
+  - GetUserName retorna "Player 1", valida tamanho do buffer e usa o erro
+    BUFFER_TOO_SHORT; GetUserColor retorna Blue;
+  - ponteiros, usuario e buffers invalidos retornam erros UserService, sem
+    acessar memoria host diretamente.
+
+libSceSystemService:
+  - GetStatus devolve a estrutura completa zerada e a contagem de eventos;
+  - ParamGetInt cobre idioma, data, relogio, fuso, horario de verao,
+    parental control e comportamento do botao Enter;
+  - ParamGetString fornece o nome de sistema "PlayStation 4";
+  - GetDisplaySafeAreaInfo grava ratio 1.0 e limpa toda a area reservada;
+  - ReceiveEvent implementa a estrutura de 8196 bytes e erro NO_EVENT;
+  - HideSplashScreen altera o estado observavel do servico;
+  - LoadExec retorna ENOSYS: uma DLL embedded nao pode substituir o processo
+    host e ainda nao existe callback publico para solicitar novo executavel.
+
+libSceSysmodule:
+  - LoadModule, LoadModuleInternal, LoadModuleInternalWithArg, IsLoaded,
+    IsLoadedInternal e UnloadModule validam IDs e mantem refcounts;
+  - IDs internos sao normalizados sem o bit 0x80000000 e respeitam modulos
+    debug/retail e restricoes por compiled SDK da tabela atual;
+  - GetModuleHandleInternal devolve handle logico estavel para modulo loaded;
+  - PreloadModuleForLibkernel usa g_preload_list_3 traduzida de indices para
+    IDs, com a selecao retail e os gates de SDK 2.00, 4.50, 7.00 e 7.50;
+  - os aliases by-name/unload-internal que sao stubs no shadPS4 preservam o
+    mesmo sucesso neutro;
+  - GetModuleInfoForUnwind retorna ENOENT enquanto o loader nao expuser ao
+    estado HLE nome, EH frame e segmentos de cada imagem;
+  - load/preload registra estado logico. Ele nao localiza nem carrega PRX
+    sob demanda; os PRX presentes em sce_module continuam sendo carregados
+    antecipadamente pelo loader da maquina.
+
+Dependencias e testes:
+  - filas de eventos e refcounts sao reinicializados no reset/cleanup HLE;
+  - o linker dinamico passou a aceitar essas tres bibliotecas na geracao de
+    providers, preservando NID, library, module e tipo STT_FUNC/STT_OBJECT;
+  - testes sinteticos cobrem InitialUser, UserName, ParamGetInt, safe area,
+    LoadModule, preload e NIDs stub de UserService/SystemService;
+  - a suite tests\shadps4\test_loader.py passa integralmente;
+  - GameTest: zero imports nao resolvidos dessas tres bibliotecas; restam 47
+    avisos de outras bibliotecas e 45 relocations pendentes;
+  - CUSA02456: zero imports nao resolvidos dessas tres bibliotecas; restam 7
+    avisos de outras bibliotecas e 5 relocations pendentes.
+
+Como repetir:
+  1. em PowerShell, iniciar o build pelo shell MSYS2 com PATH explicito:
+     C:\msys64\usr\bin\sh.exe -c ^
+       "export PATH=/usr/bin:/ucrt64/bin:$PATH; ^
+        ninja -C build-shadps4-check qemu-system-shadps4.dll"
+  2. executar:
+     python tests\shadps4\test_loader.py ^
+       build-shadps4-check\qemu-system-shadps4.dll
+  3. executar os dois eboot.bin pelo worker em modo linked e filtrar avisos
+     unresolved pelos modules libSceUserService, libSceSystemService e
+     libSceSysmodule;
+  4. executar:
+     C:\msys64\usr\bin\strip.exe --strip-unneeded ^
+       build-shadps4-check\qemu-system-shadps4.dll
+  5. repetir a suite apos strip, conferir os exports e calcular SHA-256.
+
+Artefato final desta etapa:
+  - build-shadps4-check\qemu-system-shadps4.dll;
+  - strip --strip-unneeded aplicado;
+  - tamanho: 6824033 bytes;
+  - SHA-256: 4400B626000465040BBB43242832E9A4C7C4084226302A8FE2B284F7F84C9BE5;
+  - suite completa aprovada depois do strip;
+  - qemu_host_start_with_args ausente dos exports.
+
+
+47. LOADER DE MODULOS, LIBKERNEL E NUCLEO DE LIBSCENET
+=======================================================
+
+Implementado em 14/07/2026 por prioridade estrutural. Este bloco conecta o
+estado real do loader ao HLE, em vez de manter respostas de module-info sem
+relacao com as imagens carregadas.
+
+Metadados e ciclo de vida das imagens:
+  - cada imagem preserva basename, segmentos PT_LOAD, base individual,
+    identificador TLS e metadados PT_GNU_EH_FRAME;
+  - o loader interpreta o formato comum version=1/pcrel-sdata4 de
+    .eh_frame_hdr e publica endereco e extensao estimada do .eh_frame;
+  - main ELF e PRX antecipadamente carregados sao publicados no estado HLE;
+  - reset/cleanup remove primeiro as referencias HLE e depois libera nomes,
+    simbolos, segmentos e demais metadados das imagens.
+
+APIs de modulo de libkernel:
+  - sceKernelGetModuleList/GetModuleList2 enumeram handles das imagens reais;
+  - sceKernelGetModuleInfo, GetModuleInfo2 e GetModuleInfoInternal preenchem
+    nome, segmentos, protecoes, base TLS e campos ABI conhecidos;
+  - sceKernelGetModuleInfoFromAddr encontra a imagem e o segmento que contem
+    o endereco guest;
+  - sceKernelGetModuleInfoForUnwind fornece segmentos, EH frame header e
+    EH frame sem inventar enderecos;
+  - sceKernelDlsym calcula o NID Orbis a partir do nome solicitado e procura
+    o export definido na imagem selecionada;
+  - sceKernelLoadStartModule reconhece um PRX que ja foi carregado
+    antecipadamente e devolve seu handle. Carga fisica sob demanda ainda nao
+    existe; um caminho ausente retorna ENOENT;
+  - aliases de library sao aceitos apenas quando NID e module correspondem a
+    um export estatico funcional conhecido. Nao existe fallback global.
+
+Fechamento estrutural de libkernel:
+  - as variantes restantes de kqueue/kevent, rede, tempo, coredump, sinais e
+    pthread foram ligadas aos dispatches existentes;
+  - a auditoria atual nao encontra tuple registrada de module=libkernel sem
+    provider;
+  - operacoes que dependem de transporte/backend ausente continuam retornando
+    ENOSYS, em vez de sucesso neutro.
+
+Nucleo de libSceNet:
+  - sceNetHtonl, sceNetHtonll, sceNetHtons, sceNetNtohl, sceNetNtohll e
+    sceNetNtohs executam conversao big-endian real para 16, 32 e 64 bits;
+  - libSceNet participa do resolvedor estrutural por module e NID;
+  - os demais NIDs de libSceNet ainda sem backend usam o dispatch explicito
+    NET_UNSUPPORTED_SOCKET, definem net_errno=ENOSYS e devolvem -ENOSYS;
+  - isso elimina lacunas de linker do modulo sem declarar HTTP, sockets ou
+    configuracao de rede funcional onde o callback de host nao oferece ABI.
+
+Auditoria global da referencia atual:
+  - 5127 registros LIB_FUNCTION/LIB_OBJ encontrados;
+  - 5043 tuples unicas de NID/library/module e 4756 NIDs unicos;
+  - 2416 tuples possuem provider estrutural e 2627 continuam pendentes;
+  - 2250 NIDs possuem ao menos uma variante coberta e 2506 permanecem
+    completamente sem provider;
+  - libkernel e libSceNet possuem zero tuples sem provider. Parte dessa
+    cobertura devolve ENOSYS deliberadamente e nao deve ser contabilizada
+    como HLE funcional completo.
+
+Testes adicionados e resultados:
+  - ELFs sinteticos cobrem ModuleList, ModuleInfo, ModuleInfoFromAddr,
+    ModuleInfoForUnwind, alias de library, LoadStartModule e Dlsym;
+  - testes ABI exercitam htonl, htonll e ntohs com valores nao simetricos;
+  - tests\shadps4\test_loader.py: PASS;
+  - GameTest/CUSA13032: 2425/2468 relocations, 45 pendentes, zero de
+    libkernel/libSceNet;
+  - CUSA02456: 2453/2456 relocations, 5 pendentes, zero de
+    libkernel/libSceNet.
+
+Como repetir:
+  1. criar um TMPDIR gravavel e executar ninja no ambiente MSYS2 UCRT64;
+  2. executar tests\shadps4\test_loader.py contra a DLL gerada;
+  3. executar os dois eboot.bin pelo worker em modo linked e conferir as
+     contagens unresolved;
+  4. executar strip --strip-unneeded na DLL;
+  5. repetir a suite, conferir exports/imports e calcular tamanho/SHA-256.
+
+Artefato final desta etapa:
+  - build-shadps4-check\qemu-system-shadps4.dll;
+  - tamanho antes do strip: 9592824 bytes;
+  - tamanho depois de strip --strip-unneeded: 6830177 bytes;
+  - SHA-256: 4E93264AE478BA4A843C0E71695984B7D049A951D45162D21518EA6F8E2E7208;
+  - suite Phase 7 aprovada sobre a DLL stripped;
+  - exports qemu_host_init, qemu_host_start, qemu_host_main_loop_step,
+    qemu_host_request_shutdown e qemu_host_cleanup confirmados;
+  - qemu_host_start_with_args ausente;
+  - imports desktop proibidos auditados como ausentes. SwitchToFiber e
+    DeleteFiber permanecem intencionalmente: ambos constam na lista UWP e
+    entram por api-ms-win-core-fibers-l2-1-1.dll. Criacao/conversao usam
+    somente CreateFiberEx e ConvertThreadToFiberEx.
+
+
+48. FECHAMENTO DOS NIDS COM PROVIDER EXISTENTE
+===============================================
+
+Implementado e validado em 14/07/2026. O escopo desta etapa foi todo NID que
+ja possuia provider nos modulos HLE suportados pelo qemu-system-shadps4, mas
+que ainda chegava a fallback generico ou ENOSYS por falta de mapa, operacao ou
+dependencia de host.
+
+Auditoria de providers:
+  - libkernel: 460 NIDs de referencia, 460 providers explicitos, zero faltas;
+  - libSceSysmodule: 16/16, zero faltas;
+  - libSceLibcInternal: 59/59, zero faltas;
+  - libSceNet: 219/219, zero faltas;
+  - libSceNetCtl: 93/93, zero faltas;
+  - libSceHttp2: 55/55, zero faltas;
+  - libSceAjm: 22/22, zero faltas;
+  - libSceNgs2: 66/66, zero faltas;
+  - libSceAvPlayer: 27/27, zero faltas;
+  - libSceUserService: 8 providers especificos e 415 providers STUBBED pelo
+    stub generico equivalente, total 423/423;
+  - libSceSystemService: 7 providers especificos e 462 providers STUBBED pelo
+    stub generico equivalente, total 469/469;
+  - a auditoria de corpos encontrou zero funcao nao-STUBBED da referencia fora
+    dos mapas. Os 306 mapas adicionados como SHADPS4_HLE_SUCCESS correspondem
+    somente a funcoes marcadas STUBBED/DUMMY no shadPS4. NIDs desconhecidos
+    continuam usando fallback restritivo e nao viram sucesso silencioso.
+
+libSceLibcInternal:
+  - OrbisFILE passou a ser representado por slots de 512 bytes em uma arena
+    guest, com indices 5..255 e associacao a descritores virtuais do HLE;
+  - _Fofind, _Foprep, _Fopen, _Fspos, _Nnl, _Frprep, _Fofree, locks, fopen,
+    fseek, fread e fclose usam o storage title-scoped existente;
+  - snprintf interpreta inteiros, strings, ponteiros, caracteres e double.
+    Argumentos inteiros iniciam em R10 e doubles em XMM0 conforme SysV;
+  - sceLibcHeapGetTraceInfo valida e inicializa a estrutura de saida;
+  - reset limpa arena, tabela de slots e descritores associados.
+
+Rede e libkernel:
+  - bind, listen, accept, shutdown, sendto, recvfrom, sendmsg, recvmsg,
+    getsockname, getpeername, getsockopt e setsockopt usam callbacks do host;
+  - os aliases libkernel/libScePosix apontam para os mesmos dispatches reais;
+  - socket(domain,type,protocol) foi separado corretamente de
+    sceNetSocket(name,domain,type,protocol);
+  - socketpair ganhou callback opcional e adota os dois handles de modo
+    transacional;
+  - sceNetResolverStartNtoa aceita IPv4 literal ou usa callback resolve;
+  - sceNetResolverStartNtoaMultipleRecords publica um registro IPv4 na ABI;
+  - epoll destroy, InetPtonEx, get MAC e resolver get-error foram ligados;
+  - a ABI QemuHostNetworkCallbacks continua version=1 e compativel por size.
+    Campos novos sao opcionais e foram acrescentados somente ao final.
+
+Storage e demais servicos:
+  - QemuHostStorageCallbacks recebeu truncate opcional ao final da estrutura;
+  - ftruncate/truncate usam o callback do host. Hosts antigos preservam o
+    fallback de crescimento; reducao sem callback retorna ENOSYS limpo;
+  - NGS2 cobre enumeracao, informacoes, sample rate, grain, reset de options,
+    rack query e lifecycle de reports;
+  - AJM cobre lifecycle de batches, construcao binaria dos jobs e parser MP3
+    basico, com validacao de overflow e rollback de handles em falhas;
+  - AvPlayer StreamInfo valida o player e informa ausencia de streams quando
+    nao existe demuxer conectado.
+
+Limites semanticos preservados:
+  - providers STUBBED da referencia sao no-op explicito; isso nao os converte
+    em implementacoes funcionais de servicos inexistentes;
+  - transferencia HTTP real continua condicionada a um backend HTTP; consultas
+    de resposta sem backend retornam ENOSYS;
+  - AvPlayer nao decodifica midia sem demuxer/decoder conectado e Start devolve
+    ENOSYS nesse estado;
+  - esses casos ja possuem provider e validacao de lifecycle, mas nao devem ser
+    anunciados como transporte HTTP ou decodificacao de video completos.
+
+Como repetir o build no MSYS2 UCRT64 a partir de PowerShell:
+  1. criar C:\Users\user1\qemu-11\.tmp-build;
+  2. executar:
+     C:\msys64\msys2_shell.cmd -defterm -no-start -ucrt64 -c ^
+       "cd /c/Users/user1/qemu-11 && ^
+        export TMPDIR=C:/Users/user1/qemu-11/.tmp-build ^
+               TMP=C:/Users/user1/qemu-11/.tmp-build ^
+               TEMP=C:/Users/user1/qemu-11/.tmp-build && ^
+        ninja -C build-shadps4-check -j1 qemu-system-shadps4.dll"
+  3. executar antes do strip:
+     C:\msys64\ucrt64\bin\python.exe tests\shadps4\test_loader.py ^
+       build-shadps4-check\qemu-system-shadps4.dll
+  4. executar:
+     C:\msys64\ucrt64\bin\strip.exe --strip-unneeded ^
+       build-shadps4-check\qemu-system-shadps4.dll
+  5. repetir a suite sobre a DLL stripped;
+  6. executar GameTest e CUSA02456 com test_loader.py --worker em modo linked;
+  7. auditar exports/imports com objdump -p e calcular Get-FileHash -Algorithm
+     SHA256.
+
+Resultados finais:
+  - suite tests\shadps4\test_loader.py: PASS antes e depois do strip;
+  - GameTest/CUSA13032: 2425/2468 relocations, 45 pendentes fora dos modulos
+    cobertos por esta etapa;
+  - CUSA02456: 2453/2456 relocations, 5 pendentes fora dos modulos cobertos;
+  - tamanho antes do strip: 9624648 bytes;
+  - tamanho depois de strip --strip-unneeded: 6860385 bytes;
+  - SHA-256: 7F52E9A61B5B3E20ABB4609943B87B99A96C433AD7AB739E5AC3C89BDB3AD227;
+  - exports qemu_host_init/start/main_loop_step/request_shutdown/reset/join/
+    cleanup e os registradores de callbacks confirmados apos strip;
+  - qemu_host_start_with_args ausente;
+  - zero marcadores do caminho local de source na DLL final;
+  - registry, USER32, WINMM, OLE32, APIs desktop de fiber e demais imports
+    proibidos auditados como ausentes. As dependencias transitivas do runtime
+    MSYS2 ainda precisam ser empacotadas e validadas pelo WACK para UWP/Xbox.
+
+49. BACKENDS FUNCIONAIS E PONTE HLE UWP (2026-07-14)
+
+Objetivo:
+  - remover os ENOSYS funcionais restantes dos providers HTTP, AvPlayer e
+    SystemService;
+  - permitir que NIDs de bibliotecas de plataforma ainda nao portadas sejam
+    implementados no aplicativo UWP sem adicionar imports Win32 desktop a DLL;
+  - preservar o fallback restritivo quando o host nao oferece a ponte.
+
+API publica adicionada em include/qemu/qemu-host.h:
+  - qemu_host_register_http_callbacks;
+  - qemu_host_register_media_callbacks;
+  - qemu_host_register_launch_callback;
+  - qemu_host_register_hle_callback;
+  - qemu_host_hle_callback_enabled.
+
+HTTP/HTTP2:
+  - create request, headers, envio, status, headers de resposta, content length,
+    leitura, abort e close passam pelo QemuHostHttpCallbacks version=1;
+  - payloads sao copiados entre memoria guest e host com limite de 32 MiB;
+  - headers usam consulta de tamanho e uma arena guest limitada a 2 MiB;
+  - handles do host sao separados dos handles Orbis e fechados em delete,
+    exclusao recursiva e cleanup;
+  - um host UWP pode implementar o contrato com Windows.Web.Http/HttpClient.
+
+AvPlayer:
+  - open, start, stop, pause, resume, jump, looping, current time, stream count,
+    stream info e leitura de frames passam por QemuHostMediaCallbacks version=1;
+  - os NIDs de audio, video e video Ex possuem dispatches distintos;
+  - frames sao copiados para uma arena guest de 32 MiB e os metadados Orbis
+    recebem ponteiro, timestamp, dimensoes, pitch ou formato de audio;
+  - AddSourceEx le corretamente o par ponteiro/u32 length, sem tratar padding
+    como um u64;
+  - um host UWP pode usar Media Foundation/WinRT ou decoder proprio, sem o QEMU
+    importar COM desktop, USER32 ou bibliotecas de janela.
+
+SystemService LoadExec:
+  - valida path e ate 64 argumentos guest;
+  - encaminha a transicao ao QemuHostLaunchCallback;
+  - nunca chama exit(), CreateProcess ou API de processo desktop dentro da DLL.
+
+Ponte para NIDs externos:
+  - QemuHostHLERequest entrega module, library, NID e os sete argumentos da ABI;
+  - read_guest/write_guest permitem acessar buffers guest durante o callback;
+  - request, strings, token e accessors so sao validos durante a chamada;
+  - o callback e sincrono e deve devolver errno negativo no erro e preencher o
+    resultado Orbis no sucesso;
+  - registrar qemu_host_register_hle_callback ANTES de qemu_host_init. Assim o
+    linker inclui stubs apenas para imports externos que podem ser encaminhados;
+  - sem callback registrado antes do init, NIDs desconhecidos permanecem
+    unresolved como antes. NIDs de objeto/dados tambem nao sao encaminhados;
+  - a ponte nao transforma automaticamente um NID em implementacao semantica.
+    Cada NID externo ainda deve ser implementado pelo callback UWP ou devolver
+    -ENOSYS. Providers internos sempre tem precedencia sobre a ponte.
+
+Teste acrescentado:
+  - tests/shadps4/test_loader.py registra a ponte antes do init;
+  - carrega um NID sintetico de libSceExternalTest;
+  - valida module/library/NID e os argumentos;
+  - le "UWP" da memoria guest, grava "HOST" e devolve 42 ao codigo x86;
+  - a suite completa continua cobrindo os providers internos existentes.
+  - um ELF adicional valida SystemServiceLoadExec, incluindo path, argv e o
+    retorno do callback de launch.
+
+Validacao final desta etapa:
+  - build da DLL: PASS;
+  - suite completa antes e depois de strip: PASS;
+  - GameTest com ponte registrada: 2468/2468 relocations, unresolved=0;
+  - CUSA02456 com ponte registrada: 2456/2456 relocations, unresolved=0;
+  - os dois jogos ainda param por excecao porque o callback de teste devolve
+    ENOSYS para os NIDs reais externos. Zero unresolved aqui comprova apenas o
+    encaminhamento estrutural;
+  - tamanho antes de strip: 9639762 bytes;
+  - tamanho depois de strip --strip-unneeded: 6873185 bytes;
+  - SHA-256 stripped:
+    3529F344EB1532BBDA394ED4BFAB31E4EFFABFAC79A7D025799E7014D16814C1;
+  - novos exports HTTP, media, launch e HLE confirmados por objdump;
+  - qemu_host_start_with_args permanece ausente;
+  - nenhum caminho C:/Users/user1/qemu-11 foi encontrado na DLL;
+  - ADVAPI32, USER32, WINMM e OLE32 permanecem ausentes. O backend de coroutine
+    importa CreateFiberEx/ConvertThreadToFiberEx e as operacoes de fibra
+    DeleteFiber/SwitchToFiber pelos API sets, sem as variantes desktop
+    CreateFiber/ConvertThreadToFiber.
+
+
+45. AUDITORIA DE ROBUSTEZ DO QEMU-SYSTEM-SHADPS4 (2026-07-14)
+
+Escopo revisado:
+  - ciclo de vida da DLL e callbacks do host;
+  - loader ELF/SELF, colocacao dos PRX, linker/NID e imagem de stubs HLE;
+  - memoria guest, mmap/munmap/mprotect, memoria direta e TLS;
+  - ponte HLE externa, HTTP/HTTP2 e AvPlayer;
+  - fila PM4/GPU, VideoOut, Pad e audio;
+  - build UWP, exports e imports PE;
+  - suite sintetica e os titulos GameTest e CUSA02456.
+
+Erros corrigidos:
+  - HTTP GET_HEADERS agora conserva a capacidade obtida na primeira chamada e
+    rejeita um callback que aumente o tamanho na segunda chamada. Isso elimina
+    escrita e copia fora do buffer;
+  - AvPlayer conserva a capacidade do frame e rejeita crescimento entre a
+    consulta e a leitura, eliminando leitura fora do buffer host;
+  - operacoes de memoria guest com tamanho zero agora retornam sucesso, inclusive
+    read_guest/write_guest da ponte externa. Operacoes nao vazias validam CPU,
+    ponteiro e overflow do intervalo de 64 bits;
+  - leitura de string, argumentos na pilha e o setimo argumento do dispatcher
+    verificam overflow antes de somar ao endereco guest;
+  - munmap e mprotect primeiro leem todas as PTEs e fazem rollback em falha de
+    escrita. Os slots so mudam de estado depois que a operacao inteira termina;
+  - falha ao devolver o endereco de mmap ao guest desfaz o mapeamento;
+  - alocacao de memoria direta verifica overflow do alinhamento e so avanca o
+    cursor depois de gravar o resultado com sucesso;
+  - mprotect usa indice de 64 bits antes de converter para slot, impedindo que um
+    endereco guest muito alto seja truncado para um slot valido;
+  - DirectMemoryQuery rejeita overflow de a0 + 1/alinhamento;
+  - colocacao da imagem principal, PRX e stubs HLE usa alinhamento verificado e
+    comprova os limites fisico e virtual antes de escrever na RAM;
+  - o linker ignora relocations ja aplicadas, tornando uma segunda passagem
+    idempotente e evitando underflow de unresolved_relocation_count;
+  - filas GPU limitam ring_dwords e validam overflow do fim do ring; acessos GPU
+    tambem validam o intervalo guest;
+  - qemu_host_join rejeita uma segunda chamada concorrente, evitando dois joins
+    sobre o mesmo QemuThread.
+
+Regressao adicionada:
+  - o callback sintetico externo testa read_guest(NULL, 0) e
+    write_guest(NULL, 0), ambos com tamanho zero;
+  - tests/shadps4/test_loader.py continua passando integralmente.
+
+Validacao desta auditoria antes do strip:
+  - build-shadps4-check/qemu-system-shadps4.dll: 9646981 bytes;
+  - SHA-256: 6D8CF106692397F9B9CB8072C0C839CD0492327BD9A5F29988656C7077EA667D;
+  - suite Phase 7 loader/HLE/TCG: PASS;
+  - GameTest: 2468/2468 relocations, unresolved=0;
+  - CUSA02456: 2456/2456 relocations, unresolved=0;
+  - ambos os titulos ainda param na excecao esperada quando o callback de teste
+    devolve ENOSYS para HLE externo real. Isso nao representa compatibilidade
+    semantica completa dos NIDs;
+  - qemu_host_start_with_args continua ausente;
+  - nao foi encontrado caminho absoluto do workspace na DLL;
+  - imports desktop Reg*, USER32, WINMM, OLE32, CreateFiber e
+    ConvertThreadToFiber continuam ausentes;
+  - corrotinas importam CreateFiberEx/ConvertThreadToFiberEx e
+    DeleteFiber/SwitchToFiber pelos API sets.
+
+Comandos para repetir:
+  1. configurar com -Duwp=true e --target-list=x86_64-shadps4-softmmu;
+  2. executar ninja -C build-shadps4-check -j1 qemu-system-shadps4.dll;
+  3. executar python tests/shadps4/test_loader.py
+     build-shadps4-check/qemu-system-shadps4.dll;
+  4. executar os dois eboot.bin com test_loader.py --worker em modo linked para
+     registrar a ponte antes de qemu_host_init;
+  5. executar strip --strip-unneeded na DLL final;
+  6. repetir a suite e a auditoria de objdump/strings depois do strip.
+
+Resultado final depois de strip --strip-unneeded:
+  - tamanho: 6880353 bytes;
+  - SHA-256: D515FCC0D8CE6639F1152BED7B8B5462813895261651D39F1226261C6B76054D;
+  - suite Phase 7 loader/HLE/TCG: PASS;
+  - GameTest: 2468/2468 relocations, unresolved=0;
+  - CUSA02456: 2456/2456 relocations, unresolved=0;
+  - imports/simbolos proibidos da lista UWP auditada: zero;
+  - caminhos absolutos do workspace: zero.
+
+
+50. PRIMEIRO LOTE DOS NIDS SEM PROVIDER: AUDIO IN/OUT (2026-07-14)
+
+Escopo implementado:
+  - libSceAudioIn passou de 3 para 42/42 providers;
+  - libSceAudioOut passou de 6 para 71/71 providers;
+  - 104 NIDs unicos antes ausentes ganharam provider interno;
+  - a cobertura global passou de 2250 para 2354 NIDs unicos;
+  - a quantidade completamente sem provider interno caiu de 2506 para 2402;
+  - tuples NID/library/module pendentes cairam de 2627 para 2523.
+
+AudioIn:
+  - HqOpen reutiliza o caminho funcional de Open e a fila de entrada enviada
+    pelo host UWP por qemu_host_send_audio_input;
+  - GetSilentState valida o handle e informa dispositivo disponivel enquanto a
+    porta de captura estiver aberta;
+  - os demais 37 NIDs adicionados retornam sucesso somente porque as funcoes
+    correspondentes estao marcadas explicitamente STUBBED no shadPS4.
+
+AudioOut:
+  - GetLastOutputTime publica o timestamp virtual da ultima entrega ao backend;
+  - GetPortState publica output, canais, volume e campos reservados no layout
+    Orbis de 32 bytes;
+  - GetSystemState valida e zera a estrutura Orbis de 32 bytes;
+  - SetMixLevelPadSpk valida porta PadSpk e limite de 0 dB;
+  - tipo da porta, mix level e ultimo timestamp passaram a fazer parte do estado
+    de cada porta;
+  - os demais providers adicionados correspondem aos no-ops STUBBED da
+    referencia, incluindo aliases de library com module libSceAudioOut.
+
+Dependencias UWP:
+  - nenhuma DLL desktop foi adicionada;
+  - entrada continua sendo fornecida pelo callback do host;
+  - saida continua usando o backend QEMU/XAudio2 existente;
+  - formatos, tamanhos, canais e enderecos guest continuam validados.
+
+Testes:
+  - HqOpen funcional;
+  - um NID STUBBED de AudioIn;
+  - GetSystemState funcional;
+  - um NID STUBBED de AudioOut;
+  - suite Phase 7 completa: PASS;
+  - GameTest: 2468/2468, unresolved=0;
+  - CUSA02456: 2456/2456, unresolved=0;
+  - ambos continuam parando no HLE externo ainda sem semantica no callback de
+    teste, como antes deste lote.
+
+Artefato stripped deste lote:
+  - build-shadps4-check/qemu-system-shadps4.dll;
+  - tamanho: 6884961 bytes;
+  - SHA-256: 5C8E36A2F5C1F6F575AF1B6D4C04C9993C0DA05D12A487EF13EEB57A11516FA7;
+  - suite completa depois do strip: PASS;
+  - imports/simbolos desktop proibidos auditados: zero;
+  - qemu_host_start_with_args: ausente.
+
+
+Pendencia real:
+  - ainda faltam 2402 NIDs unicos com implementacao interna;
+  - a ponte externa continua resolvendo funcoes sob demanda, mas nao conta como
+    implementacao semantica;
+  - os proximos blocos devem ser separados por dependencia: GnmDriver/Pad,
+    HTTP/SSL, Font, SaveData, Camera/HMD, NP/PSN e perifericos.
+
+
+51. SEGUNDO LOTE DE NIDS: PAD E SAVEDATA (2026-07-14)
+
+Escopo implementado:
+  - libScePad passou de 8 para 92/92 providers registrados pela referencia;
+  - libSceSaveData passou de 14 para 80/95 providers internos;
+  - 150 NIDs unicos antes ausentes ganharam provider interno;
+  - a cobertura global passou de 2354 para 2504 NIDs unicos;
+  - os NIDs completamente sem provider interno cairam de 2402 para 2252;
+  - tuples NID/library/module pendentes cairam de 2523 para 2373.
+
+Pad funcional:
+  - Init agora controla o estado de inicializacao;
+  - Open/OpenExt registram userId, port type e index; Close remove os metadados;
+  - GetHandle consulta a tupla aberta em vez de fabricar um handle;
+  - ReadState reutiliza a captura completa de botoes, analogicos, touch e motion,
+    mas respeita o retorno zero da ABI desta funcao;
+  - GetInfo escreve a estrutura Orbis de 152 bytes;
+  - GetExtControllerInformation e DeviceClassGetExtendedInformation escrevem os
+    layouts Orbis de 40 e 20 bytes;
+  - ResetLightBar envia azul padrao ao callback de output do host;
+  - ResetOrientation valida o handle. A orientacao continua vindo do host UWP;
+  - SetLightBarForTracker reutiliza o transporte real de lightbar;
+  - os 75 exports restantes retornam sucesso somente porque estao marcados
+    explicitamente STUBBED no shadPS4.
+
+Correcao ABI encontrada durante o build:
+  - OrbisPadControllerInformation tinha 22 bytes no QEMU por causa do atributo
+    packed, embora a ABI PS4 alinhe a estrutura para 24 bytes;
+  - foram adicionados os dois bytes finais e asserts de compilacao para os
+    layouts de 20, 24, 40 e 152 bytes.
+
+SaveData:
+  - foram adicionados os 66 NIDs que a referencia marca explicitamente STUBBED;
+  - os 14 providers funcionais anteriores continuam cobrindo init/term,
+    mount/unmount, parametros, busca, exclusao, eventos e save memory;
+  - os 15 exports reais restantes continuam externos/nao suportados. Eles nao
+    foram convertidos em sucesso generico, evitando mascarar falta de semantica.
+
+Testes e validacao antes do strip:
+  - novos ELFs sinteticos cobrem Pad GetInfo, um stub de Pad e um stub de
+    SaveData;
+  - suite Phase 7 loader/HLE/TCG: PASS;
+  - GameTest: 2468/2468 relocations, unresolved=0;
+  - CUSA02456: 2456/2456 relocations, unresolved=0;
+  - ambos ainda param na excecao esperada quando a ponte externa retorna ENOSYS
+    para um HLE real ainda nao implementado.
+
+Pendencias prioritarias apos este lote:
+  - 15 providers reais de SaveData, principalmente backup/copia/icon/cloud;
+  - SSL/HTTP, Font e os caminhos semanticos ainda incompletos de GnmDriver;
+  - NP/PSN, Camera/HMD e perifericos especializados.
+
+Artefato final deste lote:
+  - build-shadps4-check/qemu-system-shadps4.dll;
+  - tamanho antes do strip: 9656789 bytes;
+  - tamanho depois de strip --strip-unneeded: 6890081 bytes;
+  - SHA-256 stripped:
+    1BFC87697217F87E6F069DBC9AD37B9F1CF0EBCE95E5448EBF5E9653D3B84C95;
+  - suite completa depois do strip: PASS;
+  - imports/simbolos desktop proibidos auditados: zero;
+  - caminhos absolutos do workspace: zero;
+  - qemu_host_start_with_args: ausente.
+
+
+52. TERCEIRO LOTE DE NIDS: SSL, HTTP E FONT (2026-07-14)
+
+Escopo implementado:
+  - libSceSsl passou a cobrir 208/208 exports registrados pelo shadPS4;
+  - libSceHttp ganhou 51 providers de compatibilidade e passou para 71/115;
+  - libSceFont ganhou 130 providers de compatibilidade e passou para 130/229;
+  - libSceFontFt ganhou 19 providers e passou para 19/21;
+  - 407 NIDs unicos antes ausentes ganharam provider interno;
+  - a cobertura global passou de 2504 para 2911 NIDs unicos;
+  - os NIDs completamente sem provider interno cairam de 2252 para 1845;
+  - tuples NID/library/module pendentes cairam de 2373 para 1966.
+
+SSL:
+  - sceSslInit agora possui contador de contextos proprio e valida o tamanho do
+    pool solicitado;
+  - foi corrigido um erro anterior no qual o NID de sceSslInit apontava para
+    SHADPS4_HLE_HTTP_INIT;
+  - os outros 207 NIDs retornam sucesso somente porque cada funcao esta marcada
+    explicitamente STUBBED na referencia;
+  - a whitelist usa tokens delimitados e nao aceita prefixos ou NIDs inventados.
+
+HTTP:
+  - foram preservados os 20 providers funcionais existentes para lifecycle,
+    templates, conexoes, requests, headers, epoll, envio, status e leitura;
+  - foram adicionados os 51 NIDs que a referencia marca explicitamente STUBBED;
+  - os 44 exports HTTP reais restantes continuam externos, sem falso sucesso.
+
+Font e FontFt:
+  - foram adicionados somente os 130 e 19 NIDs explicitamente STUBBED;
+  - shaping, selecao, metricas, rasterizacao e demais rotinas reais continuam
+    externas ate existir um backend de fontes com semantica adequada;
+  - NIDs desconhecidos desses modulos continuam sem provider interno.
+
+Regressoes adicionadas:
+  - sceSslInit retorna o primeiro contexto;
+  - um stub exato de SSL, HTTP, Font e FontFt retorna sucesso internamente;
+  - a suite Phase 7 loader/HLE/TCG continua passando integralmente.
+
+Validacao antes do strip:
+  - GameTest: 2468/2468 relocations, unresolved=0;
+  - CUSA02456: 2456/2456 relocations, unresolved=0;
+  - ambos param na excecao esperada quando a ponte externa devolve ENOSYS para
+    HLE real ainda nao implementado.
+
+Pendencias prioritarias apos este lote:
+  - 15 providers reais restantes de SaveData;
+  - 44 providers reais restantes de HTTP;
+  - 101 providers reais de Font/FontFt;
+  - semantica restante de GnmDriver, NP/PSN, Camera/HMD e perifericos.
+
+Artefato final deste lote:
+  - build-shadps4-check/qemu-system-shadps4.dll;
+  - tamanho antes do strip: 9662055 bytes;
+  - tamanho depois de strip --strip-unneeded: 6895201 bytes;
+  - SHA-256 stripped:
+    6CF92A3889904FE6FC7CEC070127A36F97E450875E858C300EBF9BD3E0AC6B90;
+  - suite completa depois do strip: PASS;
+  - imports/simbolos desktop proibidos auditados: zero;
+  - caminhos absolutos do workspace: zero;
+  - qemu_host_start_with_args: ausente.
+
+
+53. QUARTO LOTE DE NIDS: SHELL, HMD E NP (2026-07-14)
+
+Escopo implementado:
+  - libSceShellCoreUtil passou para 217/217 providers;
+  - libSceHmd ganhou 157 providers STUBBED de 178 exports;
+  - libSceNpTus ganhou 118 providers STUBBED de 142 exports;
+  - libSceLncUtil passou para 79/79 providers;
+  - libSceNpTrophy ganhou 75 providers STUBBED de 87 exports;
+  - 646 NIDs unicos antes ausentes ganharam provider interno;
+  - a cobertura global passou de 2911 para 3557 NIDs unicos;
+  - os NIDs completamente sem provider interno cairam de 1845 para 1199;
+  - tuples NID/library/module pendentes cairam de 1966 para 1320.
+
+Politica de compatibilidade:
+  - cada whitelist foi extraida dos registros e corpos STUBBED do shadPS4;
+  - ShellCoreUtil e LncUtil sao integralmente no-op na referencia atual;
+  - as 21 funcoes reais de HMD, 24 de NpTus e 12 de NpTrophy continuam
+    externas e nao retornam sucesso falso;
+  - NIDs desconhecidos ou apenas parcialmente coincidentes nao sao aceitos.
+
+Regressoes adicionadas:
+  - um ELF sintetico para cada uma das cinco bibliotecas valida resolucao
+    interna e retorno zero;
+  - a suite Phase 7 loader/HLE/TCG passa integralmente;
+  - GameTest: 2468/2468 relocations, unresolved=0;
+  - CUSA02456: 2456/2456 relocations, unresolved=0;
+  - a excecao posterior continua sendo causada pelo callback externo ENOSYS
+    para HLE real ainda sem semantica.
+
+Pendencias prioritarias apos este lote:
+  - 1199 NIDs ainda sem provider interno;
+  - GameLiveStreaming, Remoteplay, RazorCpu, Rudp, Voice e SystemStateMgr tem
+    grandes grupos integralmente STUBBED;
+  - SaveData, HTTP, Font, HMD, NpTus e NpTrophy ainda possuem operacoes reais;
+  - GnmDriver, NP/PSN, Camera e perifericos exigem implementacao semantica.
+
+Artefato final deste lote:
+  - build-shadps4-check/qemu-system-shadps4.dll;
+  - tamanho antes do strip: 9670443 bytes;
+  - tamanho depois de strip --strip-unneeded: 6903393 bytes;
+  - SHA-256 stripped:
+    0668148EFCBC4D534FD22FA4EBB4D51AB59D488E24B6E5A800D8F71430AFF4D6;
+  - suite completa depois do strip: PASS;
+  - imports/simbolos desktop proibidos auditados: zero;
+  - caminhos absolutos do workspace: zero;
+  - qemu_host_start_with_args: ausente.
+
+
+54. QUINTO LOTE DE NIDS: NP E SERVICOS AUXILIARES (2026-07-14)
+
+Escopo implementado:
+  - libSceNpWebApi ganhou 49 providers STUBBED de 100 exports;
+  - libSceGameLiveStreaming passou para 45/45 providers;
+  - libSceRemoteplay ganhou 41 providers STUBBED de 42 exports;
+  - libSceIme ganhou 41 providers STUBBED, preservando os providers funcionais;
+  - libSceNpTusCompat ganhou 35 providers STUBBED;
+  - libSceRazorCpu passou para 35/35 providers;
+  - libSceRudp passou para 34/34 providers;
+  - libSceVoice passou para 30/30 providers.
+
+Contagem:
+  - 310 tuples NID/library/module ganharam provider interno;
+  - os 35 NIDs de NpTusCompat tambem existem em NpTus e nao aumentam a
+    contagem unica;
+  - 275 NIDs unicos antes ausentes ganharam provider interno;
+  - a cobertura global passou de 3557 para 3832 NIDs unicos;
+  - os NIDs completamente sem provider interno cairam de 1199 para 924;
+  - tuples NID/library/module pendentes cairam de 1320 para 1010.
+
+Politica de compatibilidade:
+  - somente corpos marcados explicitamente STUBBED no shadPS4 retornam sucesso;
+  - operacoes reais de WebApi, Remoteplay e Ime continuam externas;
+  - NIDs desconhecidos continuam fora da whitelist;
+  - Audio3d foi adiado porque a referencia registra aliases duplicados que
+    precisam ser separados antes da contagem e implementacao.
+
+Regressoes e validacao:
+  - um ELF sintetico para cada biblioteca valida resolucao e retorno interno;
+  - suite Phase 7 loader/HLE/TCG: PASS;
+  - GameTest: 2468/2468 relocations, unresolved=0;
+  - CUSA02456: 2456/2456 relocations, unresolved=0;
+  - ambos continuam parando no callback externo ENOSYS para HLE real pendente.
+
+Pendencias prioritarias apos este lote:
+  - 924 NIDs unicos ainda sem provider interno;
+  - SystemStateMgr, NpParty, CommonDialog, AppContent e Camera possuem novos
+    grupos STUBBED seguros;
+  - SaveData, HTTP, Font, GnmDriver, HMD e NP ainda exigem semantica real.
+
+Artefato final deste lote:
+  - build-shadps4-check/qemu-system-shadps4.dll;
+  - tamanho antes do strip: 9674857 bytes;
+  - tamanho depois de strip --strip-unneeded: 6907489 bytes;
+  - SHA-256 stripped:
+    89AD79A85B881C87F63EBB4DA9D9647517EE39E57FEEBA47EE453803C69EBDEA;
+  - suite completa depois do strip: PASS;
+  - imports/simbolos desktop proibidos auditados: zero;
+  - caminhos absolutos do workspace: zero;
+  - qemu_host_start_with_args: ausente.
+
+
+55. SEXTO LOTE DE NIDS: CAMERA, PARTY E SERVICOS DE SISTEMA (2026-07-14)
+
+Escopo implementado:
+  - libSceSystemStateMgr passou para 27/27 providers;
+  - libSceCamera ganhou 26 providers STUBBED de 76 exports;
+  - libSceNpParty passou para 26/26 providers;
+  - libSceAppContent ganhou 24 providers STUBBED de 31 exports;
+  - libSceSharePlay passou para 24/24 providers;
+  - libSceSystemGesture passou para 22/22 providers;
+  - libSceVrTracker ganhou 20 providers STUBBED.
+
+Contagem:
+  - 169 NIDs unicos antes ausentes ganharam provider interno;
+  - a cobertura global passou de 3832 para 4001 NIDs unicos;
+  - os NIDs completamente sem provider interno cairam de 924 para 755;
+  - tuples NID/library/module pendentes cairam de 1010 para 841.
+
+Politica de compatibilidade:
+  - somente os NIDs marcados STUBBED na referencia retornam sucesso;
+  - captura real de camera, tracking VR, AppContent e demais funcoes reais
+    continuam externas;
+  - as whitelists usam comparacao delimitada e rejeitam NIDs desconhecidos.
+
+Regressoes e validacao:
+  - um ELF sintetico por biblioteca valida provider e retorno interno;
+  - suite Phase 7 loader/HLE/TCG: PASS;
+  - GameTest: 2468/2468 relocations, unresolved=0;
+  - CUSA02456: 2456/2456 relocations, unresolved=0;
+  - a parada posterior continua sendo o callback externo ENOSYS esperado.
+
+Pendencias prioritarias apos este lote:
+  - 755 NIDs unicos ainda sem provider interno;
+  - NetCtlApIpcInt, Audio3d, CompanionHttpd, ScreenShot, NpScore, Mouse e
+    AppMessaging possuem os proximos grupos STUBBED;
+  - funcoes reais de SaveData, HTTP, Font, GPU, Camera, HMD e NP permanecem.
+
+Artefato final deste lote:
+  - build-shadps4-check/qemu-system-shadps4.dll;
+  - tamanho antes do strip: 9677712 bytes;
+  - tamanho depois de strip --strip-unneeded: 6910049 bytes;
+  - SHA-256 stripped:
+    0569729FC968FF1C760FA3FCAB208114A75C1479D7F2DDC9CFF8053C71083F0E;
+  - suite completa depois do strip: PASS;
+  - imports/simbolos desktop proibidos auditados: zero;
+  - caminhos absolutos do workspace: zero;
+  - qemu_host_start_with_args: ausente.
+
+
+56. SETIMO LOTE DE NIDS: REDE, AUDIO3D E PERIFERICOS (2026-07-14)
+
+Escopo implementado:
+  - libSceNetCtlApIpcInt passou para 16/16 providers;
+  - libSceCompanionHttpd passou para 16/16 providers;
+  - libSceAudio3d ganhou 16 providers STUBBED deduplicados;
+  - libSceScreenShot ganhou 13 providers STUBBED;
+  - libSceNpScore ganhou 12 providers STUBBED;
+  - libSceNetCtlAp passou para 11/11 providers;
+  - libSceMouse passou para 10/10 providers;
+  - libSceAppMessaging passou para 10/10 providers;
+  - libSceNetBwe passou para 9/9 providers.
+
+Contagem:
+  - 113 tuples NID/library/module ganharam provider interno;
+  - ScreenShot compartilha um NID com AppContent;
+  - 112 NIDs unicos antes ausentes ganharam provider interno;
+  - a cobertura global passou de 4001 para 4113 NIDs unicos;
+  - os NIDs completamente sem provider interno cairam de 755 para 643;
+  - tuples NID/library/module pendentes cairam de 841 para 728.
+
+Politica de compatibilidade:
+  - aliases duplicados de Audio3d foram deduplicados antes da whitelist;
+  - somente corpos STUBBED retornam sucesso;
+  - rede AP real, servidor companion, captura de tela, mouse e audio espacial
+    reais continuam externos.
+
+Regressoes e validacao:
+  - um ELF sintetico por biblioteca valida resolucao interna;
+  - suite Phase 7 loader/HLE/TCG: PASS;
+  - GameTest: 2468/2468 relocations, unresolved=0;
+  - CUSA02456: 2456/2456 relocations, unresolved=0.
+
+Pendencias prioritarias apos este lote:
+  - 643 NIDs unicos ainda sem provider interno;
+  - dialogs auxiliares, variantes de SystemService, NetCtlV6, NpWebApi2,
+    CompanionUtil e extensoes HMD/VR formam os proximos grupos seguros;
+  - as operacoes reais dos subsistemas principais continuam prioritarias.
+
+Artefato final deste lote:
+  - build-shadps4-check/qemu-system-shadps4.dll;
+  - tamanho antes do strip: 9680135 bytes;
+  - tamanho depois de strip --strip-unneeded: 6912097 bytes;
+  - SHA-256 stripped:
+    5C8E5F5EB38AA9390DF25FFCB62917109831413EF9072E13680982DBECFEB94D;
+  - suite completa depois do strip: PASS;
+  - imports/simbolos desktop proibidos auditados: zero;
+  - caminhos absolutos do workspace: zero;
+  - qemu_host_start_with_args: ausente.
+
+
+57. OITAVO LOTE DE NIDS: DIALOGS E VARIANTES DE SERVICOS (2026-07-14)
+
+Escopo implementado:
+  - WebBrowserDialog: 8 providers STUBBED;
+  - SigninDialog, ActivateHevc, ActivateHevcSoft e HmdSetupDialog: 7 cada;
+  - ActivateMpeg2 e NpPartyCompat: 6 cada;
+  - HmdDistortion, NetCtlV6, GnmDriverResourceRegistration,
+    VrTrackerGpuTest, NpWebApi2, CompanionUtil e VrTrackerLiveCapture: 5 cada.
+
+Contagem:
+  - 83 tuples NID/library/module ganharam provider interno;
+  - os 6 NIDs de NpPartyCompat ja existem em NpParty;
+  - 77 NIDs unicos antes ausentes ganharam provider interno;
+  - a cobertura global passou de 4113 para 4190 NIDs unicos;
+  - os NIDs completamente sem provider interno cairam de 643 para 566;
+  - tuples NID/library/module pendentes cairam de 728 para 645.
+
+Politica de compatibilidade:
+  - somente corpos STUBBED na referencia retornam sucesso;
+  - dialogs, codecs, HMD/VR, NP, NetCtl e registro GNM reais continuam
+    externos quando nao possuem implementacao semantica;
+  - as variantes Compat sao registradas por modulo, mesmo quando compartilham
+    o NID com a biblioteca principal.
+
+Regressoes e validacao:
+  - um ELF sintetico por biblioteca valida resolucao interna;
+  - suite Phase 7 loader/HLE/TCG: PASS;
+  - GameTest: 2468/2468 relocations, unresolved=0;
+  - CUSA02456: 2456/2456 relocations, unresolved=0.
+
+Artefato final deste lote:
+  - build-shadps4-check/qemu-system-shadps4.dll;
+  - tamanho antes do strip: 9683335 bytes;
+  - tamanho depois de strip --strip-unneeded: 6914657 bytes;
+  - SHA-256 stripped:
+    2FBD54082680AFE5BE3A22FDFCC8FAF290219F01A93457AA6A5DBEC8D1445D55;
+  - suite completa depois do strip: PASS;
+  - imports/simbolos desktop proibidos auditados: zero;
+  - caminhos absolutos do workspace: zero;
+  - qemu_host_start_with_args: ausente.
+
+Pendencias prioritarias apos este lote:
+  - 566 NIDs unicos ainda sem provider interno;
+  - grupos residuais de 1 a 4 stubs e as implementacoes reais dos subsistemas
+    principais formam as proximas etapas.
+
+
+58. NONO LOTE DE NIDS: STUBS RESIDUAIS E IDENTIDADE DE MODULO (2026-07-14)
+
+Escopo implementado:
+  - CommonDialog: 26 providers STUBBED;
+  - AppContentUtil: 24 providers corrigidos para o modulo registrado;
+  - AppContent e NpManager: 7 tuples cada;
+  - Usbd: 4 providers;
+  - ContentExport, NpPartner001 e Videodec: 3 providers cada;
+  - ErrorDialog, PlayGo e PngDec: 2 tuples cada;
+  - JpegEnc, NpAuth, NpProfileDialog, NpSnsFacebookDialog, VideoOut e
+    VideoRecording: 1 provider cada.
+
+Correcao estrutural:
+  - os 24 NIDs de AppContentUtil estavam associados incorretamente ao modulo
+    libSceAppContent;
+  - o dispatcher agora distingue libSceAppContentUtil de libSceAppContent;
+  - os 7 stubs reais do modulo base AppContent possuem whitelist separada;
+  - PlayGo preserva library=libSceDbgPlayGo e module=libScePlayGo nos testes.
+
+Contagem:
+  - 89 tuples NID/library/module ganharam ou corrigiram provider interno;
+  - 87 NIDs distintos fazem parte deste lote;
+  - 63 NIDs unicos antes ausentes ganharam provider interno;
+  - a cobertura global passou de 4190 para 4253 NIDs unicos;
+  - os NIDs completamente sem provider interno cairam de 566 para 503;
+  - tuples NID/library/module pendentes cairam de 645 para 556.
+
+Politica de compatibilidade:
+  - somente funcoes marcadas STUBBED na referencia retornam sucesso;
+  - funcoes reais dos mesmos modulos continuam externas;
+  - AudioIn foi auditado e seus 37 stubs ja estavam na tabela estatica.
+
+Regressoes e validacao:
+  - um ELF sintetico por modulo valida resolucao interna;
+  - os testes suportam library e module distintos;
+  - suite Phase 7 loader/HLE/TCG: PASS;
+  - GameTest: 2468/2468 relocations, unresolved=0;
+  - CUSA02456: 2456/2456 relocations, unresolved=0.
+
+Artefato final deste lote:
+  - build-shadps4-check/qemu-system-shadps4.dll;
+  - tamanho antes do strip: 9685560 bytes;
+  - tamanho depois de strip --strip-unneeded: 6916193 bytes;
+  - SHA-256 stripped:
+    ED30A5EE1EE70FA612789F2819F9685CFD485F1B937F925BC2C51DA25DF2EC4B;
+  - suite completa depois do strip: PASS;
+  - imports/simbolos desktop proibidos auditados: zero;
+  - caminhos absolutos do workspace: zero;
+  - qemu_host_start_with_args: ausente.
+
+Pendencias prioritarias apos este lote:
+  - 503 NIDs unicos ainda sem provider interno;
+  - o trabalho restante exige principalmente semantica HLE real ou aliases
+    especificos, nao retorno de sucesso generico.
+
+
+59. DECIMO LOTE DE NIDS: NpCommon E SINCRONIZACAO NP (2026-07-14)
+
+Escopo implementado:
+  - comparacao de NpId, comparacao ordenada e comparacao de OnlineId;
+  - validacao sintatica de OnlineId e deteccao de plataforma PS3/Vita/PS4;
+  - clock monotonic em microssegundos e versao SDK do ambiente PS4;
+  - mutex e lightweight mutex com init/destroy/lock/trylock/unlock;
+  - condition variable com init/destroy/signal e espera relativa limitada;
+  - criacao e join de threads sobre os objetos de servico HLE existentes;
+  - aliases libSceNpCommon e libSceNpCommonCompat preservados por library.
+
+Contagem:
+  - 23 NIDs unicos de NpCommon ganharam implementacao semantica;
+  - 22 NIDs existem nas bibliotecas Main e Compat;
+  - sceNpGetSdkVersion existe apenas na biblioteca principal;
+  - 45 tuples NID/library/module ganharam provider interno;
+  - a cobertura global passou de 4253 para 4276 NIDs unicos;
+  - os NIDs completamente sem provider interno cairam de 503 para 480;
+  - tuples NID/library/module pendentes cairam de 556 para 511.
+
+Limites mantidos:
+  - os cinco NIDs de callout continuam externos porque dependem de execucao
+    assincrona de callbacks guest;
+  - a espera de condition variable usa o modelo HLE nao bloqueante e retorna
+    ORBIS_NP_LW_COND_ERROR_TIMEDOUT quando nao ha sinal pendente;
+  - nenhuma funcao real desconhecida foi convertida em sucesso generico.
+
+Regressoes e validacao:
+  - comparacao valida e ponteiros nulos foram testados;
+  - escrita em memoria guest foi testada para clock e versao SDK;
+  - OnlineId, plataforma e inicializacao de mutex foram executados sob TCG;
+  - suite Phase 7 loader/HLE/TCG: PASS;
+  - GameTest: 2468/2468 relocations, unresolved=0;
+  - CUSA02456: 2456/2456 relocations, unresolved=0.
+
+Artefato final deste lote:
+  - build-shadps4-check/qemu-system-shadps4.dll;
+  - tamanho antes do strip: 9688691 bytes;
+  - tamanho depois de strip --strip-unneeded: 6919265 bytes;
+  - SHA-256 stripped:
+    FC4E3092A2167DBD2C10ABDED902290BADEE3BB7DABE1CF957B421A017427C15;
+  - suite completa depois do strip: PASS;
+  - imports/simbolos desktop proibidos auditados: zero;
+  - caminhos absolutos do workspace: zero;
+  - qemu_host_start_with_args: ausente.
+
+Pendencias prioritarias apos este lote:
+  - 480 NIDs unicos ainda sem provider interno;
+  - os proximos blocos estruturais sao RTC, HTTP/WebApi e os cinco callouts
+    NpCommon quando houver scheduler de callbacks guest.
+
+
+60. DECIMO PRIMEIRO LOTE DE NIDS: libSceRtc E CORROTINAS UWP (2026-07-14)
+
+Escopo RTC implementado:
+  - os 47 NIDs registrados por libSceRtc na referencia shadPS4 possuem agora
+    providers internos exatos; a comparacao automatica encontrou zero NID
+    ausente e zero NID extra;
+  - validacao completa de OrbisRtcDateTime, comparacao de ticks, resolucao de
+    tick, ano bissexto, dias do mes e dia da semana;
+  - conversao bidirecional entre calendario gregoriano e ticks desde
+    0001-01-01, incluindo Unix epoch, Win32 FILETIME e DOS date/time;
+  - relogios realtime, network, debug-network e ad-network mantem offsets
+    independentes no estado HLE, sem alterar o relogio do processo host;
+  - conversao local/UTC e relogio local usam offset zero, coerente com o
+    backend UWP de timezone ja existente e sem consultar registry/Win32;
+  - formatacao RFC2822 e RFC3339, parsing RFC3339/RFC2822/asctime, validacao de
+    timezone e precisao em microssegundos;
+  - aritmetica de ticks para microssegundos, segundos, minutos, horas, dias,
+    semanas, meses e anos, com verificacao de overflow e ajuste do ultimo dia
+    em transicoes de mes/ano.
+
+Robustez e UWP:
+  - datas anteriores a 1970 nao passam por subtracao unsigned;
+  - parsing RFC3339 rejeita fracao vazia, texto residual e timezone invalido;
+  - ponteiros guest, datas invalidas e ticks fora de 0001..9999 retornam os
+    codigos ORBIS_RTC especificos em vez de acessar memoria indevida;
+  - util/coroutine-windows.c nao importa mais DeleteFiber, SwitchToFiber,
+    CreateFiber ou ConvertThreadToFiber no build UWP;
+  - o caminho UWP usa troca de contexto x86-64 interna, preservando todos os
+    registradores callee-saved da ABI Windows, XMM6..XMM15, MXCSR e x87 CW;
+  - builds Windows desktop continuam usando o backend de fibers original.
+
+Contagem:
+  - 47 NIDs unicos e 47 tuples NID/library/module ganharam provider interno;
+  - a cobertura global passou de 4276 para 4323 NIDs unicos;
+  - os NIDs completamente sem provider interno cairam de 480 para 433;
+  - tuples NID/library/module pendentes cairam de 511 para 464.
+
+Testes e auditoria:
+  - casos TCG cobrem ponteiro invalido, leap year, dias do mes, DateTime->tick,
+    soma de dias, parse RFC3339 e formatacao RFC3339;
+  - tests/unit/test-coroutine.exe: 12/12 testes PASS, incluindo lifecycle,
+    yield, nesting, mutex e rwlock;
+  - suite Phase 7 loader/HLE/TCG antes e depois do strip: PASS;
+  - GameTest: 2468/2468 relocations, unresolved=0;
+  - CUSA02456: 2456/2456 relocations, unresolved=0;
+  - imports desktop proibidos: zero;
+  - caminhos absolutos do workspace: zero;
+  - qemu_host_start_with_args: ausente.
+
+Artefato final deste lote:
+  - build-shadps4-check/qemu-system-shadps4.dll;
+  - tamanho antes do strip: 9699386 bytes;
+  - tamanho depois de strip --strip-unneeded: 6930596 bytes;
+  - SHA-256 stripped:
+    97F45FC7478D795E7A4C8DC4E71E261AACCB88DE291CBBAB7F7EC2AA8B74CE5C.
+
+Pendencias prioritarias apos este lote:
+  - 433 NIDs unicos ainda sem provider interno;
+  - os proximos blocos estruturais sao HTTP/WebApi e os cinco callouts
+    NpCommon quando houver scheduler de callbacks guest.
+
+
+61. DECIMO SEGUNDO LOTE: NpWebApi E NpWebApi2 SOBRE HTTP UWP (2026-07-14)
+
+Escopo implementado:
+  - contextos de biblioteca, contextos de usuario e handles WebApi possuem
+    objetos HLE tipados, hierarquia de ownership e cleanup recursivo;
+  - requests WebApi e WebApi2 reutilizam o objeto HTTP existente e chegam ao
+    host somente pelos callbacks qemu_host_http_*;
+  - create/delete, abort, headers, send, send com response info, read, status,
+    timeout e memory stats possuem dispatches com validacao de tipo/ponteiro;
+  - metodos numericos de WebApi sao convertidos para GET/POST/PUT/DELETE/PATCH;
+  - WebApi2 preserva os metodos em string;
+  - api_group e path sao combinados em URL limitada; grupos sem scheme recebem
+    https://, permitindo que o host UWP aplique autenticacao e roteamento;
+  - busca de response header e case-insensitive e limitada a 2 MiB;
+  - response information recebe status HTTP e content length quando o callback
+    do host disponibiliza esses valores.
+
+Cobertura e limites:
+  - 26 NIDs de libSceNpWebApi, 19 de libSceNpWebApi2, 3 stubs exatos de
+    libSceNpWebApi2AsyncRestricted e 1 tuple Compat foram adicionados;
+  - isso representa 48 NIDs unicos e 49 tuples NID/library/module;
+  - a cobertura global passou de 4323 para 4371 NIDs unicos;
+  - os NIDs completamente sem provider interno cairam de 433 para 385;
+  - tuples NID/library/module pendentes cairam de 464 para 415;
+  - nenhum NID de registro ou execucao de callback guest foi internalizado;
+  - filtros, push contexts e callbacks de push continuam externos ate existir
+    scheduler seguro para executar callbacks guest.
+
+Validacao:
+  - comparacao automatica confirmou 48 NIDs mapeados e zero callback incluido;
+  - testes TCG verificam contexto HTTP invalido, request invalido e user
+    context WebApi2 invalido com os codigos NP WebApi correspondentes;
+  - suite Phase 7 loader/HLE/TCG antes e depois do strip: PASS;
+  - GameTest: 2468/2468 relocations, unresolved=0;
+  - CUSA02456: 2456/2456 relocations, unresolved=0;
+  - imports desktop proibidos: zero;
+  - caminhos absolutos do workspace: zero;
+  - qemu_host_start_with_args: ausente.
+
+Artefato final deste lote:
+  - build-shadps4-check/qemu-system-shadps4.dll;
+  - tamanho antes do strip: 9706001 bytes;
+  - tamanho depois de strip --strip-unneeded: 6936784 bytes;
+  - SHA-256 stripped:
+    3EE5761795C5B2A6425B11BC2181CE361D37E4F813C188AFBD824C08BB582695.
+
+Pendencias prioritarias apos este lote:
+  - 385 NIDs unicos ainda sem provider interno;
+  - o proximo bloco estrutural e completar as operacoes portaveis restantes de
+    libSceHttp, seguido por Font e pelos callouts dependentes de scheduler.
+
+
+62. DECIMO TERCEIRO LOTE: HTTP, SAVEDATA E APPCONTENT UWP (2026-07-14)
+
+Escopo implementado em libSceHttp:
+  - 31 NIDs adicionais possuem provider interno;
+  - abort, abort force e abort wait chamam qemu_host_http_abort no handle do
+    host, sem thread Win32 ou dependencia de console;
+  - requests com metodo numerico convertem os oito metodos HTTP padrao para
+    strings e reutilizam qemu_host_http_create_request;
+  - create request 2, create connection, nonblock/try-nonblock, last errno,
+    epoll, content length, timeouts e opcoes HTTPS possuem validacao e estado;
+  - epoll handle, epoll user argument, flags/opcoes e content length usam
+    campos separados, evitando que uma configuracao sobrescreva outra;
+  - parse de URI/header/status, remocao de header e gestao de certificados
+    continuam externos, pois ainda exigem parser ou callbacks de host reais.
+
+Escopo implementado em libSceSaveData:
+  - 10 NIDs adicionais possuem provider interno;
+  - wrappers legados de setup/get/set de SaveDataMemory usam o mesmo arquivo
+    sandboxed dos entry points v2, com limites de 64 MiB/16 MiB e offsets
+    validados;
+  - sync valida inicializacao e slot; clear/get progress mantem estado real;
+  - get param valida mount point e tamanho e produz estruturas inicializadas;
+  - load/save icon leem e gravam icon0.png exclusivamente pelo callback
+    qemu_host_storage_*;
+  - umount with backup reutiliza o umount validado;
+  - backup, check backup, restore e transferring mount continuam externos ate
+    existir copia recursiva/rename transacional no contrato de storage host.
+
+Escopo implementado em libSceAppContentUtil:
+  - os 7 NIDs antes pendentes possuem provider interno;
+  - initialize preserva estado busy e inicializa o boot parameter;
+  - AppParam SKU retorna FULL; parametros ausentes retornam NOT_FOUND;
+  - sem catalogo DLC fornecido pelo host, info/list/key/mount retornam contagem
+    zero ou DRM_NO_ENTITLEMENT em vez de sucesso falso;
+  - TemporaryDataMount2 publica /temp0 com buffer de 16 bytes e validacao de
+    ponteiro, apropriado ao namespace de storage UWP.
+
+Contagem:
+  - 48 NIDs unicos e 48 tuples NID/library/module ganharam provider interno;
+  - a cobertura global passou de 4371 para 4419 NIDs unicos;
+  - os NIDs completamente sem provider interno cairam de 385 para 337;
+  - tuples NID/library/module pendentes cairam de 415 para 367;
+  - libSceAppContentUtil ficou sem NID pendente;
+  - restam 13 NIDs portaveis/estruturais de libSceHttp e 4 de libSceSaveData.
+
+Validacao e reproducao:
+  - recompilar com ninja -C build-shadps4-check -j1
+    qemu-system-shadps4.dll, mantendo TMP/TEMP/TMPDIR dentro do workspace;
+  - executar python tests/shadps4/test_loader.py
+    build-shadps4-check/qemu-system-shadps4.dll;
+  - os testes TCG cobrem handle nonblock HTTP invalido, SaveData progress antes
+    de init e AppContent SKU FULL escrito na memoria guest;
+  - executar os dois eboot.bin com test_loader.py --worker em modo linked;
+  - GameTest: 2468/2468 relocations, unresolved=0;
+  - CUSA02456: 2456/2456 relocations, unresolved=0;
+  - aplicar strip --strip-unneeded ao artefato final e repetir a suite;
+  - imports desktop proibidos: zero;
+  - caminhos absolutos do workspace: zero;
+  - qemu_host_start_with_args: ausente.
+
+Artefato final deste lote:
+  - build-shadps4-check/qemu-system-shadps4.dll;
+  - tamanho antes do strip: 9712998 bytes;
+  - tamanho depois de strip --strip-unneeded: 6943440 bytes;
+  - SHA-256 stripped:
+    6B595B411FDFCFD17F3F7488910541E3635A7B7E7992808B7E140F7BF7B78657.
+
+Pendencias prioritarias apos este lote:
+  - 337 NIDs unicos ainda sem provider interno;
+  - completar URI/header/certificados HTTP requer parser e extensao do contrato
+    host; backup SaveData requer primitivas de copia transacional;
+  - o proximo bloco independente de maior impacto e Font/FontFt, seguido pelos
+    callouts que dependem de scheduler seguro para callbacks guest.
+
+63. CINCO BLOCOS PORTAVEIS: FONT, MOVE, ZLIB, PNG ENCODER E DISC MAP
+
+Objetivo deste lote:
+  - implementar cinco blocos independentes de UI desktop e apropriados ao
+    processo UWP;
+  - manter erros explicitos para operacoes que ainda exigem rasterizador ou
+    dados do host, sem retornar sucesso falso;
+  - aumentar a cobertura estrutural sem introduzir novos imports Win32 desktop.
+
+Bloco 1 - libSceFont e libSceFontFt:
+  - bibliotecas, renderers e fontes usam handles tipados e ciclo de vida
+    validado;
+  - escala, slant, weight, metricas sinteticas, layout, kerning, navegacao de
+    caracteres, estilos, DPI e superficies possuem estado guest consistente;
+  - os acessos aos arrays de estado validam o handle antes de calcular o slot,
+    evitando leitura fora dos limites com handles guest malformados;
+  - stubs exatos identificados no shadPS4 preservam o retorno correspondente;
+  - operacoes avancadas sem rasterizador real retornam
+    SCE_FONT_ERROR_NO_SUPPORT_FUNCTION (0x80460020), em vez de sucesso falso;
+  - Font e FontFt deixam de depender de provider HLE externo para os 101 NIDs
+    deste bloco, mas isso nao equivale a rasterizacao completa de glifos.
+
+Bloco 2 - libSceMove:
+  - initialize/terminate mantem estado e rejeita transicoes invalidas;
+  - open/close usa handles tipados e libera todos os handles em terminate;
+  - consultas retornam ausencia limpa de controle Move, pois nenhum dispositivo
+    Move foi publicado pelo contrato de input host.
+
+Bloco 3 - libSceZlib:
+  - initialize/finalize, inflate, wait e get-result possuem provider interno;
+  - inflate usa a dependencia zlib ja obrigatoria do QEMU e valida tamanhos,
+    alinhamento e memoria guest;
+  - a descompressao e sincrona internamente, mas preserva handles de requisicao
+    e o formato de wait/result esperado pela ABI;
+  - o Meson liga zlib somente ao system_ss do target shadPS4.
+
+Bloco 4 - libScePngEnc:
+  - create/delete/query/encode usam handles tipados e codigos de erro do modulo;
+  - o encoder produz PNG em memoria com IHDR, IDAT, IEND, CRC e compressao zlib;
+  - suporta pixels de entrada RGBA/BGRA de 8 bits, saida RGB/RGBA, pitch
+    validado e limites de 16384x16384 e 128 MiB;
+  - nao depende de libpng nem de API de arquivo, console ou UI desktop.
+
+Bloco 5 - libSceDiscMap:
+  - os cinco NIDs possuem provider interno;
+  - consultas que exigem bitmap de disco retornam NO_BITMAP;
+  - a variante sem bitmap valida e zera os tres resultados de saida.
+
+Contagem baseada no mesmo snapshot usado na secao anterior:
+  - 126 NIDs unicos ganharam provider interno: 101 Font/FontFt, 11 Move,
+    5 Zlib, 4 PngEnc e 5 DiscMap;
+  - a cobertura global passou de 4419 para 4545 NIDs unicos;
+  - NIDs completamente sem provider interno cairam de 337 para 211;
+  - tuples NID/library/module pendentes cairam de 367 para 241.
+
+Validacao:
+  - build incremental do alvo qemu-system-shadps4.dll: aprovado;
+  - suite Phase 7 loader/HLE/TCG antes e depois do strip: PASS;
+  - os testes guest cobrem Move initialize, Zlib initialize, PngEnc query
+    valido/invalido, DiscMap NO_BITMAP e inicializacao do frame de estilo Font;
+  - GameTest: 2468/2468 relocations, unresolved=0;
+  - CUSA02456: 2456/2456 relocations, unresolved=0;
+  - imports desktop proibidos: zero;
+  - caminhos absolutos do workspace na DLL: zero;
+  - qemu_host_start_with_args: ausente da DLL e dos fontes compilaveis.
+
+Comandos essenciais para reproduzir:
+  1. ninja -C build-shadps4-check -j1 qemu-system-shadps4.dll
+  2. python tests/shadps4/test_loader.py
+     build-shadps4-check/qemu-system-shadps4.dll
+  3. executar GameTest e CUSA02456 com test_loader.py --worker em modo linked
+  4. strip --strip-unneeded
+     build-shadps4-check/qemu-system-shadps4.dll
+  5. repetir a suite e as auditorias de objdump/strings na DLL stripped
+
+Artefato final deste lote:
+  - build-shadps4-check/qemu-system-shadps4.dll;
+  - tamanho antes do strip: 9723668 bytes;
+  - tamanho depois de strip --strip-unneeded: 6953710 bytes;
+  - SHA-256 stripped:
+    FB3DB21CDAF66802FE848AF4103A05A78A0CF3E0A7EEF4B007E0A64FF20B1993.
+
+64. Cinco blocos estruturais de maior impacto - Fiber, HTTP, SaveData, NP e VideoOut
+------------------------------------------------------------------------------------
+
+Este lote adiciona provider interno para 55 NIDs unicos que ainda estavam
+pendentes no snapshot da secao 63. Todos os providers usam memoria guest
+validada e permanecem portaveis para o build UWP, sem introduzir console,
+registry, USER32, WINMM, COM desktop ou fibers Win32.
+
+Bloco 1 - libSceFiber, 15 NIDs:
+  - initialize/initialize-internal, option initialize, finalize, get-info,
+    context-size-check e rename preservam layout, assinaturas, alinhamentos,
+    estados e codigos de erro da ABI do shadPS4;
+  - tamanho e soma do contexto possuem limites e protecao contra overflow;
+  - run/switch/get-self/return/frame-pointer validam os argumentos e retornam
+    SCE_FIBER_ERROR_PERMISSION quando exigiriam transferir o contexto x86-64
+    guest dentro do gateway SYSCALL. Eles nao retornam sucesso falso;
+  - a troca efetiva de contexto continua sendo uma pendencia funcional.
+
+Bloco 2 - libSceHttp, 13 NIDs:
+  - parse de status e headers retorna offsets e comprimentos dentro do buffer
+    guest, com limites para impedir leituras e alocacoes sem controle;
+  - URI build, escape, unescape, merge, parse e sweep usam GLib e gravam o
+    layout OrbisHttpUriElement no pool guest;
+  - CA-list e estado de certificado HTTPS possuem contratos deterministas;
+  - remocao de header passa pelo callback HTTP do host como overwrite vazio,
+    pois o contrato de embedding atual nao possui callback remove separado.
+
+Bloco 3 - libSceSaveData, 4 NIDs:
+  - backup, check-backup e restore validam inicializacao, titleId e dirName;
+  - a copia e limitada a 512 MiB e profundidade 16, ignora tipos especiais e
+    usa diretorio temporario seguido de rename, evitando destino parcial;
+  - transferring-mount publica /savedata0 em modo de leitura e exige que o
+    save exista no storage virtual do host.
+
+Bloco 4 - libSceNpCommon/libSceNpCommonCompat, 5 NIDs unicos:
+  - init/term mantem active, stop-requested e head no layout guest original;
+  - start/start64 registra deadline, handler e argumento e rejeita duplicatas;
+  - stop remove a entrada da lista e escreve o indicador removed;
+  - o QEMU ainda nao possui um executor geral para chamar uma funcao guest de
+    forma assincrona fora do retorno de SYSCALL. Portanto o registro da fila e
+    funcional, mas o disparo posterior do handler continua pendente.
+
+Bloco 5 - libSceVideoOut, 18 NIDs:
+  - eventos flip/vblank, status de resolucao/vblank, labels, capability,
+    unregister, event-id/data/count, gamma, color, mode e mudanca de atributo
+    agora possuem dispatch real em vez de cair na lista generica de stubs;
+  - buffers sao agrupados pelo attributeIndex e conversoes little-endian sao
+    aplicadas antes de atualizar o estado do host display;
+  - gamma invalido nao altera o estado persistido;
+  - wait-vblank permanece nao bloqueante no gateway atual; contadores e
+    eventos continuam ligados ao relogio virtual e ao caminho de flip.
+
+Contagem baseada no mesmo snapshot da secao 63:
+  - 55 NIDs unicos ganharam provider interno;
+  - a cobertura global passou de 4545 para 4600 NIDs unicos;
+  - NIDs completamente sem provider interno cairam de 211 para 156;
+  - as 55 entradas representam 60 tuples NID/library/module, devido aos cinco
+    aliases de libSceNpCommonCompat;
+  - tuples pendentes cairam de 241 para 181.
+
+Validacao do artefato stripped:
+  - build incremental qemu-system-shadps4.dll: aprovado sem warnings novos;
+  - suite Phase 7 loader/HLE/TCG: PASS;
+  - cinco novos testes TCG cobrem Fiber, HTTP, SaveData, NP e VideoOut;
+  - GameTest: 2468/2468 relocations, unresolved=0;
+  - CUSA02456: 2456/2456 relocations, unresolved=0;
+  - os 55 NIDs selecionados aparecem no resolver, sem ausencias;
+  - imports Win32 desktop proibidos: zero;
+  - caminhos absolutos do workspace na DLL: zero;
+  - qemu_host_start_with_args: ausente da DLL e dos fontes compilaveis.
+
+Comandos essenciais para reproduzir:
+  1. ninja -C build-shadps4-check -j1 qemu-system-shadps4.dll
+  2. python tests/shadps4/test_loader.py
+     build-shadps4-check/qemu-system-shadps4.dll
+  3. executar os dois eboot.bin com test_loader.py --worker em modo linked
+  4. strip --strip-unneeded
+     build-shadps4-check/qemu-system-shadps4.dll
+  5. repetir suite, jogos e auditorias objdump/strings na DLL stripped
+
+Artefato final deste lote:
+  - build-shadps4-check/qemu-system-shadps4.dll;
+  - tamanho depois de strip --strip-unneeded: 6977104 bytes;
+  - SHA-256 stripped:
+    2F999F8DCC9824024F31D7361792499A5ECE77437979C971339523B59B0A6B4C.
+
+65. Cinco blocos NP de maior impacto - Matching2, Score, TUS, Signaling e WebApi
+--------------------------------------------------------------------------------
+
+Escopo deste lote, conferido contra os registros LIB_FUNCTION da arvore atual
+do shadPS4:
+  - libSceNpMatching2: 58 NIDs;
+  - libSceNpScore/libSceNpScoreCompat: 39 NIDs unicos;
+  - libSceNpTus/libSceNpTusCompat: 26 NIDs unicos antes sem provider real;
+  - libSceNpSignaling: 24 NIDs;
+  - libSceNpWebApi/libSceNpWebApiCompat: 25 NIDs unicos residuais;
+  - total: 172 NIDs unicos e 203 tuples NID/library/module, contando aliases
+    Compat.
+
+Bloco 1 - libSceNpMatching2:
+  - initialize/terminate validam estado e tamanho 0x28/0x30;
+  - contextos sao objetos reais, com create/destroy, callbacks, server id e
+    limpeza no terminate;
+  - start sem shadNet retorna o timeout de resolver observado na referencia;
+  - operacoes que exigem servidor retornam SERVER_NOT_AVAILABLE, sem sucesso
+    ficticio.
+
+Bloco 2 - libSceNpScore:
+  - title contexts e requests possuem ownership, limite global e exclusao em
+    cascata;
+  - abort, poll, wait e player-character-id mantem estado por request/contexto;
+  - ranking e gravacao remotos retornam NO_LOGIN enquanto nao existir provider
+    PSN, preservando os erros COMMUNITY exatos.
+
+Bloco 3 - libSceNpTus:
+  - title contexts e requests foram ligados para as variantes normal, A, TSS e
+    Compat;
+  - get/set selecionados concluem deterministicamente a requisicao local e
+    poll/wait publicam o resultado no guest;
+  - a operacao remota sem provider retorna NO_LOGIN e IDs invalidos retornam
+    INVALID_ID.
+
+Bloco 4 - libSceNpSignaling:
+  - initialize/terminate controlam o estado global e limpam contextos;
+  - create/delete context, callback/user-data e context option sao persistidos;
+  - memory info e erros NOT_INITIALIZED/CTX_NOT_FOUND/CONN_NOT_FOUND seguem os
+    valores da referencia;
+  - conexoes P2P continuam explicitamente indisponiveis sem transporte PSN.
+
+Bloco 5 - libSceNpWebApi residual:
+  - filtros push/service/extended possuem IDs, ownership e delete;
+  - callbacks diretos e por filtro, unregister, abort handle e handle timeout
+    mantem estado no contexto;
+  - multipart part valida request e publica o indice;
+  - IntInitialize e IntCreateRequest usam suas ABIs proprias, incluindo o
+    setimo argumento de saida;
+  - UtilityParseNpId decodifica base64, valida o online-id e grava a estrutura
+    no guest.
+
+Validacao:
+  - build incremental da DLL: aprovado;
+  - suite Phase 7 loader/HLE/TCG antes e depois do strip: PASS;
+  - cinco testes TCG novos exercitam um NID e erro exato por bloco;
+  - comparacao automatica dos mapas com a referencia: zero NIDs invalidos;
+  - Matching2: 58/58 NIDs da referencia mapeados;
+  - Signaling: 24/24 NIDs da referencia mapeados;
+  - GameTest: 2468/2468 relocations, unresolved=0;
+  - CUSA02456: 2456/2456 relocations, unresolved=0;
+  - imports Win32 desktop proibidos: zero;
+  - caminhos absolutos do workspace na DLL: zero;
+  - qemu_host_start_with_args na DLL: zero.
+
+Reproducao:
+  1. ninja -C build-shadps4-check -j1 qemu-system-shadps4.dll
+  2. python tests/shadps4/test_loader.py
+     build-shadps4-check/qemu-system-shadps4.dll
+  3. executar GameTest e CUSA02456 pelo worker em modo linked
+  4. strip --strip-unneeded
+     build-shadps4-check/qemu-system-shadps4.dll
+  5. repetir suite, jogos, objdump -p e strings no artefato stripped
+
+Artefato final deste lote:
+  - build-shadps4-check/qemu-system-shadps4.dll;
+  - tamanho depois de strip --strip-unneeded: 6987344 bytes;
+  - SHA-256 stripped:
+    A09449CCAC2E2B24F075B1627F82B43E1F86E29250A075522E19B224920F9C01.
+
+66. Oito blocos com mais NIDs pendentes
+----------------------------------------
+
+Escopo auditado contra os registros LIB_FUNCTION da arvore atual do shadPS4:
+  - libSceVideodec2: 11 NIDs;
+  - libSceNpCommerce: 11 NIDs;
+  - libSceSsl: 11 NIDs residuais;
+  - libSceImeDialog: 10 NIDs residuais;
+  - libSceInvitationDialog e Compat: 9 NIDs unicos, 11 registros;
+  - libScePlayGoDialog: 7 NIDs;
+  - libSceNpProfileDialog e Compat: 7 NIDs residuais, 8 registros;
+  - libSceVrTracker e variantes: 9 NIDs;
+  - total: 75 NIDs unicos e 78 registros.
+
+Videodec2:
+  - query de memoria compute/decoder publica tamanhos, alinhamento e ponteiros
+    conforme os layouts 0x18/0x48 da referencia;
+  - filas compute validam pipe, queue, reservados e memoria;
+  - decoders possuem handles reais, create/delete/reset e erros de instancia;
+  - nao existe engine de video PS4 neste QEMU. Decode e flush validam a ABI,
+    recusam o frame e retornam API_FAIL em vez de fabricar video decodificado.
+
+NpCommerce e dialogs:
+  - estados NONE/INITIALIZED/RUNNING/FINISHED, close/term/status/result e erros
+    CommonDialog foram ligados ao callback de dialogo do host;
+  - Commerce persiste userData e estado/layout do icone da loja sem UI Win32;
+  - IME Dialog ganhou aliases InitInternal, posicao absoluta do painel, tamanho,
+    star state, force-close e erros especificos;
+  - Invitation/Profile preservam userData/callbackArg e resultados cancelados;
+  - PlayGoDialog segue o comportamento dummy da referencia, inclusive result=3;
+  - o stub preexistente NpProfileDialogOpenA permaneceu sucesso por
+    compatibilidade e nao foi convertido para a ABI do Open normal.
+
+SSL2 e VrTracker:
+  - os 11 NIDs SSL2 selecionados sao success stubs exatos de ssl2.cpp no
+    shadPS4; nao adicionam Win32 TLS nem fingem transporte criptografado;
+  - VrTracker valida QueryMemory/Init, publica onion/garlic/work memory,
+    controla init/term e registra um handle por HMD, pad, Move e gun;
+  - GetTime usa o relogio virtual, e aliases DeviceRejection/FourDeviceAllowed
+    foram registrados.
+
+Resultado da auditoria:
+  - os oito blocos ficaram sem NID ausente;
+  - pendencias globais cairam de 121 registros/116 NIDs unicos para
+    43 registros/41 NIDs unicos;
+  - os maiores blocos restantes sao WebBrowserDialog, PngDec, Mouse,
+    ulobjmgr e Videodec.
+
+Validacao e reproducao:
+  1. ninja -C build-shadps4-check -j1 qemu-system-shadps4.dll
+  2. python tests/shadps4/test_loader.py
+     build-shadps4-check/qemu-system-shadps4.dll
+  3. executar GameTest e CUSA02456 pelo worker em modo linked
+  4. auditar imports com objdump -p e caminhos com strings
+  5. strip --strip-unneeded
+     build-shadps4-check/qemu-system-shadps4.dll
+  6. repetir suite, jogos e auditorias no artefato stripped
+
+Resultados antes do strip:
+  - build incremental: aprovado sem warnings novos;
+  - suite Phase 7 loader/HLE/TCG, incluindo doze casos novos: PASS;
+  - GameTest: 2468/2468 relocations, unresolved=0;
+  - CUSA02456: 2456/2456 relocations, unresolved=0;
+  - ambos ainda param na excecao guest ja conhecida depois do bootstrap.
+
+Artefato final stripped:
+  - suite Phase 7 loader/HLE/TCG: PASS;
+  - GameTest: 2468/2468 relocations, unresolved=0;
+  - CUSA02456: 2456/2456 relocations, unresolved=0;
+  - imports Win32 desktop proibidos: zero;
+  - caminhos absolutos do workspace: zero;
+  - qemu_host_start_with_args: ausente;
+  - tamanho: 7018064 bytes;
+  - SHA-256:
+    0003511641E26D447AF4F98006C9C46B5AEA04338C8A41A6A2BEDA01576885C0.
+
+67. Fechamento dos NIDs residuais
+---------------------------------
+
+Escopo:
+  - foram tratados os 43 registros/41 NIDs unicos que restavam na auditoria
+    com provider interno, incluindo os aliases GameLiveStreaming;
+  - a auditoria residual, descontando bibliotecas atendidas por provider
+    generico de modulo, ficou com zero NID sem provider;
+  - os IDs de dispatch foram anexados ao fim de ShadPS4HLEFunction para nao
+    alterar os valores dos lotes anteriores;
+  - as implementacoes ficaram isoladas em hw/i386/shadps4-services6.inc.c.
+
+Blocos implementados:
+  - CommonDialog IsUsed, CompanionHttpd GetEvent e ErrorDialog close/status;
+  - GameLiveStreaming debug start/stop, Screenshot DRC e Remoteplay status;
+  - JpegEnc create/delete/query com handle na memoria fornecida pelo guest;
+  - Mouse init/open/read/close com handles, modo merged e erros Orbis;
+  - MsgDialog e SaveDataDialog progress, alem de SaveDataDialog IsReady;
+  - NpPartner subscription, Random, PngDec, Videodec e WebBrowserDialog;
+  - os quatro exports ulobjmgr residuais, com EINVAL e escrita do object id.
+
+Contratos e limitacoes explicitas:
+  - PngDec ParseHeader interpreta assinatura/IHDR e publica dimensoes, cor,
+    profundidade e interlace. O build UWP nao incorpora um decoder desktop;
+    Decode valida handle/ponteiros e retorna PNG_DEC_DECODE_ERROR;
+  - Videodec QueryResourceInfo calcula memoria/alinhamento e Create possui
+    handle real. Decode/Flush retornam API_FAIL apos validar a ABI porque nao
+    existe engine AVC PS4 neste QEMU;
+  - Videodec Delete/Reset e NpPartner Terminate conservaram os success stubs
+    legados ja cobertos pela suite, evitando regressao de compatibilidade;
+  - funcoes marcadas STUBBED com ORBIS_OK na referencia mantem sucesso exato;
+  - nenhum caminho novo usa Win32 desktop, console ou qemu_host_start_with_args.
+
+Testes adicionados:
+  - nove casos TCG em tests/shadps4/test_loader.py exercitam os novos providers
+    CommonDialog, CompanionHttpd, GameLive, Mouse, Random, Remoteplay,
+    SaveDataDialog, WebBrowserDialogLimited e ulobjmgr;
+  - CompanionHttpd valida o codigo NO_EVENT e o evento DISCONNECT escrito no
+    guest; Remoteplay valida o status desconectado; SaveData valida retorno 1.
+
+Como reproduzir:
+  1. ninja -C build-shadps4-check -j1 qemu-system-shadps4.dll
+  2. python tests/shadps4/test_loader.py
+     build-shadps4-check/qemu-system-shadps4.dll
+  3. python tests/shadps4/test_loader.py --worker
+     build-shadps4-check/qemu-system-shadps4.dll
+     C:\Users\user1\Projetos\GameTest\eboot.bin gametest.log linked
+  4. repetir o worker para
+     C:\Users\user1\Projetos\CUSA02456\eboot.bin
+  5. objdump -p build-shadps4-check/qemu-system-shadps4.dll
+  6. strip --strip-unneeded build-shadps4-check/qemu-system-shadps4.dll
+  7. repetir a suite, os dois jogos e as auditorias no artefato stripped.
+
+Resultados finais em 14/07/2026:
+  - build incremental: PASS;
+  - suite Phase 7 loader/HLE/TCG antes e depois do strip: PASS;
+  - GameTest: 2468/2468 relocations, unresolved=0;
+  - CUSA02456: 2456/2456 relocations, unresolved=0;
+  - ambos continuam na mesma excecao guest conhecida depois do bootstrap;
+  - imports Win32 desktop proibidos: zero;
+  - DLLs desktop proibidas: zero;
+  - caminhos absolutos do workspace: zero;
+  - qemu_host_start_with_args: ausente;
+  - exports host obrigatorios auditados: 7;
+  - tamanho unstripped: 9799614 bytes;
+  - tamanho final depois de strip --strip-unneeded: 7025232 bytes;
+  - SHA-256 final:
+    AD658944619E7CCACFAEE79C9F3E2624DD54D2B8601D0C1EAC11083B0E1B86A1.
+
+68. Auditoria de corretude e gargalos
+--------------------------------------
+
+Problemas encontrados e corrigidos:
+  - Videodec Decode sobrescrevia a estrutura de entrada com a estrutura de
+    framebuffer antes de validar thisSize. Agora usa buffers separados e
+    valida 48/24 bytes; QueryResourceInfo limita dimensoes/DPB e impede overflow;
+  - Random retornava 0x817c0001 em argumentos invalidos; o contrato correto
+    0x817c0016 foi restaurado;
+  - write em stdout/stderr consumia no maximo 256 bytes e informava escrita
+    parcial. Agora percorre todo o buffer em chunks e rejeita wrap de endereco;
+  - ding-dong dividia comandos PM4 no fim do ring, quebrando pacotes que
+    atravessavam a borda. Agora recompõe o stream circular e faz um submit unico;
+  - reset de audio limpava audio_queue antes do teste de NULL e em duplicidade;
+  - o build UWP ainda importava GetConsoleMode/SetConsoleMode e enumeracao de
+    drives. Os caminhos agora sao no-op/indisponiveis sob CONFIG_UWP.
+
+Validacao final em 14/07/2026:
+  - build incremental e link da DLL: PASS, sem warnings novos;
+  - GCC -fanalyzer: nenhum defeito concreto de memoria; apenas caminhos HLE
+    grandes marcados como complexos demais para analise completa;
+  - Phase 7 antes e depois do strip: PASS;
+  - GameTest: 2468/2468 relocations, unresolved=0;
+  - CUSA02456: 2456/2456 relocations, unresolved=0;
+  - GetConsoleMode, SetConsoleMode, GetLogicalDriveStrings e GetDriveType: zero;
+  - demais imports desktop proibidos auditados: zero;
+  - caminhos absolutos do workspace: zero;
+  - 39 exports qemu_host_* preservados;
+  - tamanho final depois de strip --strip-unneeded: 7024569 bytes;
+  - SHA-256 final:
+    7D576DD9D9A189BA29B6A9492381C45A1B35AB2179E2FE5F1D041BF8EE68644C.
+

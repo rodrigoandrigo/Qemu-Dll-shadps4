@@ -1,0 +1,1085 @@
+QEMU UWP/Xbox DLL Embedding Porting Guide
+=========================================
+
+Purpose
+-------
+
+This document is a porting guide for applying the UWP/Xbox DLL embedding work
+to a newer QEMU tree.
+
+It describes what was changed, why it was changed, where each change belongs,
+which source files are involved, and how to validate the result. It is not a
+line-by-line patch. Newer QEMU versions may move code around, so use the file
+map and search anchors to reapply the same design to the updated codebase.
+
+
+High-level goal
+---------------
+
+The goal is to make QEMU usable as an embeddable DLL/shared library inside a
+UWP/Xbox host application.
+
+The changes move QEMU away from desktop process assumptions:
+
+- QEMU should not require SDL for the embedding path.
+- QEMU should not own the UI thread.
+- QEMU should expose a host API for lifecycle, input, callbacks, logging, and
+  shutdown.
+- Video should be delivered to the host as framebuffer callbacks.
+- Input should enter through explicit host API calls.
+- Audio should either be delivered by callback or played through XAudio2.
+- UWP-incompatible Win32 APIs should be avoided in CONFIG_UWP builds.
+- QEMU-produced binaries should be generated as DLL/shared-library artifacts
+  instead of normal executables.
+- Runtime DLL dependencies should remain separate DLLs placed beside the QEMU
+  DLLs in the package folder.
+
+
+Recommended porting order
+-------------------------
+
+Apply the work in this order when moving to a newer QEMU version:
+
+1. Add the Meson shared-library output changes.
+2. Add the public host embedding API.
+3. Add the host display backend.
+4. Add the host audio callback backend.
+5. Add the XAudio2 audio backend.
+6. Add absolute mouse API improvements.
+7. Add the UWP build option and CONFIG_UWP wiring.
+8. Add Windows/UWP API compatibility guards.
+9. Remove SDL from the required embedding path.
+10. Add TAP networking stubs for Windows/UWP.
+11. Add Windows DLL dependency collection.
+12. Build with a minimal UWP configuration and fix compile/link errors.
+13. Test runtime loading from the UWP/Xbox host.
+
+
+Search anchors for newer QEMU versions
+--------------------------------------
+
+Use these strings to find the equivalent code locations in a newer tree:
+
+- executable('qemu-system-
+- qemu-system-
+- shared_library(
+- audio_drv_list
+- audio_drivers_available
+- audio_drivers_priority
+- AudiodevDriver
+- AudiodevGenericOptions
+- audio_create_pdos
+- audio_get_pdo_out
+- audio_get_pdo_in
+- DisplayOptions
+- display_type
+- qemu_input_queue_abs
+- qemu_input_is_absolute
+- qemu_console_is_graphic
+- qemu_console_lookup_default
+- block/file-win32.c
+- GetVersion
+- DeviceIoControl
+- CreateFiber
+- ConvertThreadToFiber
+- SetConsoleCtrlHandler
+- timeBeginPeriod
+- net_init_tap
+- tap_enable
+- tap_disable
+- tap-stub.c
+
+
+1. Meson shared-library output
+------------------------------
+
+Primary file:
+
+- meson.build
+
+Purpose:
+
+Change QEMU target generation so system emulators and selected helper tools are
+produced as shared libraries instead of normal executable binaries.
+
+What to port:
+
+- Introduce a platform shared-library suffix variable, for example:
+
+  - "dll" on Windows
+  - "dylib" on macOS
+  - "so" on other platforms
+
+- Change system emulator target creation from executable-style output to
+  Meson's shared_library() output.
+
+- Targets that normally produce files such as:
+
+  qemu-system-x86_64.exe
+
+  should instead produce:
+
+  qemu-system-x86_64.dll
+
+- Adjust target metadata so install rules and dependency-collection scripts use
+  the shared-library output name instead of an executable name.
+
+- Convert helper tools that are still needed by the package to shared_library()
+  where appropriate. In this tree that includes targets such as:
+
+  - qemu-img
+  - qemu-io
+  - qemu-nbd
+  - qemu-keymap
+  - qemu-edid
+  - qemu-bridge-helper
+  - qemu-pr-helper
+
+Important note:
+
+This does not statically merge all third-party dependencies into the main QEMU
+DLL. It only changes QEMU-produced outputs into DLL/shared-library artifacts.
+External dependencies such as GLib, pixman, zlib, gnutls, and others are still
+separate DLLs and must be packaged beside the QEMU DLLs.
+
+Validation:
+
+- Confirm build outputs contain qemu-system-*.dll instead of qemu-system-*.exe.
+- Confirm install metadata refers to .dll on Windows.
+- Confirm dependency collection scans the installed DLL outputs.
+
+
+2. Public host embedding API
+----------------------------
+
+Primary files:
+
+- include/qemu/qemu-host.h
+- system/host.c
+
+Purpose:
+
+Expose a public API that allows a host application to control QEMU after loading
+it as a DLL.
+
+What to port:
+
+- Add a public header for the host API.
+- Add exported functions for:
+
+  - initialization
+  - startup
+  - main loop stepping
+  - shutdown request
+  - reset
+  - join
+  - cleanup
+  - log callback registration
+  - video callback registration
+  - audio callback registration
+  - input callback registration
+  - keyboard input
+  - relative pointer input
+  - absolute pointer input
+  - pointer button input
+  - host log emission
+  - video frame emission
+  - audio frame emission
+  - initialized/running state checks
+
+Why:
+
+Exporting only qemu_main(argc, argv) is not a good embedding boundary. qemu_main
+is process-oriented, can block, relies on global state, and is not designed as a
+host-controlled DLL API.
+
+Validation:
+
+- Confirm qemu-host.h is installable/visible to the UWP host project.
+- Confirm qemu-system-*.dll exports the intended qemu_host_* symbols.
+- Confirm the host can initialize QEMU and request shutdown without terminating
+  the whole host process.
+
+
+3. Host display backend
+-----------------------
+
+Primary files:
+
+- ui/host-display.c
+- ui/meson.build or equivalent display build file
+- qapi/ui.json or the current QAPI display schema file
+
+Purpose:
+
+Provide a display backend that sends framebuffer updates to the embedding host
+instead of opening an SDL, GTK, Cocoa, or Win32 desktop window.
+
+What to port:
+
+- Add a display backend named "host".
+- Register it in QAPI display options.
+- Add it to the UI/display build files.
+- Deliver framebuffer updates through the host video callback.
+- Include framebuffer metadata:
+
+  - pixel pointer
+  - width
+  - height
+  - stride/pitch
+  - pixel format
+
+Important behavior:
+
+The host display backend should register listeners for console 0 even if the
+console is not graphical yet. Early VGA/BIOS boot can start with a text console
+and later switch to a graphical surface. SDL handles this case by tracking
+console 0 early; the host display backend should do the same.
+
+Validation:
+
+- Start with -display host.
+- Confirm the host receives frames during BIOS/VGA boot.
+- Confirm frames continue after the console switches from text to graphics.
+- Confirm no SDL window is required.
+
+
+4. Host audio callback backend
+------------------------------
+
+Primary files:
+
+- audio/hostaudio.c
+- audio/meson.build
+- qapi/audio.json or the current QAPI audio schema file
+- audio/audio.c
+- audio/audio_template.h
+
+Purpose:
+
+Provide an audio backend named "host" that forwards PCM output buffers to the
+embedding host through the host API.
+
+What to port:
+
+- Add audio/hostaudio.c.
+- Register the backend in audio/meson.build.
+- Add "host" to the QAPI AudiodevDriver enum.
+- Add "host" as AudiodevGenericOptions.
+- Add "host" to Meson audio driver selection if the newer QEMU version requires
+  driver availability tables.
+- Update audio_create_pdos, audio_get_pdo_out, and audio_get_pdo_in so the
+  generic "host" driver gets per-direction options.
+
+Runtime behavior:
+
+- Output audio calls qemu_host_emit_audio_frame().
+- The callback includes sample pointer, byte size, sample rate, channel count,
+  and audio format.
+- Input audio returns silence.
+
+Validation:
+
+- Configure with an audio driver list that includes host.
+- Start QEMU with:
+
+  -audiodev host,id=audio0
+
+- Confirm the host receives PCM buffers.
+
+
+5. XAudio2 audio backend
+------------------------
+
+Primary files:
+
+- audio/xaudio2audio.c
+- audio/meson.build
+- meson.build
+- meson_options.txt
+- qapi/audio.json
+- audio/audio.c
+- audio/audio_template.h
+
+Purpose:
+
+Provide a native Windows/UWP-compatible audio backend named "xaudio2".
+
+What to port in Meson:
+
+- Add a Meson feature option named "xaudio2".
+- Add "xaudio2" to audio_drv_list choices.
+- Detect xaudio2.h on Windows.
+- Link against the MinGW import library "xaudio2_9".
+- Expose CONFIG_AUDIO_XAUDIO2.
+- Add "xaudio2" to audio_drivers_available.
+- Add "xaudio2" to audio_drivers_priority before DirectSound on Windows.
+- Add audio/xaudio2audio.c to audio/meson.build when xaudio2 is available.
+
+What to port in QAPI/audio core:
+
+- Add "xaudio2" to AudiodevDriver with CONFIG_AUDIO_XAUDIO2.
+- Add "xaudio2" as AudiodevGenericOptions.
+- Update audio_create_pdos.
+- Update audio_get_pdo_out and audio_get_pdo_in.
+
+Runtime behavior:
+
+- Calls XAudio2Create().
+- Creates a mastering voice with AudioCategory_GameEffects.
+- Creates a source voice for each QEMU output voice.
+- Converts QEMU audio settings to WAVEFORMATEX.
+- Restricts output to Windows-friendly formats:
+
+  - U8
+  - S16
+  - S32
+  - F32
+
+- Queues copied PCM buffers to XAudio2.
+- Frees submitted buffers from IXAudio2VoiceCallback::OnBufferEnd.
+- Provides silent input audio for capture paths.
+
+Typical runtime argument:
+
+  -audiodev xaudio2,id=audio0
+
+Example guest audio device:
+
+  -device ich9-intel-hda -device hda-duplex,audiodev=audio0
+
+Validation:
+
+- Build with:
+
+  --enable-xaudio2 --audio-drv-list=xaudio2
+
+- Confirm qapi generated code includes AUDIODEV_DRIVER_XAUDIO2.
+- Confirm audio_xaudio2audio.c compiles.
+- Confirm the final link includes xaudio2_9.
+- Confirm audio starts without requiring SDL or DirectSound.
+
+
+6. Absolute mouse support
+-------------------------
+
+Primary files:
+
+- include/qemu/qemu-host.h
+- system/host.c
+
+Purpose:
+
+Allow the embedding host to inject absolute pointer coordinates, which are
+better suited for touch, gamepad cursor layers, and UWP/Xbox UI integration.
+
+What to port:
+
+- Keep relative mouse support through qemu_host_send_pointer_rel().
+- Add or keep qemu_host_send_pointer_abs(x, y, width, height).
+- Clamp pixel absolute coordinates to the valid display range.
+- Add qemu_host_send_pointer_abs_normalized(x, y), using a 0..0x7fff range.
+- Add qemu_host_pointer_is_absolute() so the host can check whether the guest
+  currently exposes an absolute pointing device.
+
+Important runtime requirement:
+
+QEMU can only deliver absolute pointer events correctly when the guest machine
+has an absolute pointer device, for example:
+
+  -device usb-tablet
+
+or a suitable virtio tablet device for the selected machine type.
+
+Validation:
+
+- Start the VM with an absolute pointer device.
+- Confirm qemu_host_pointer_is_absolute() returns true.
+- Send absolute coordinates and confirm the guest pointer jumps to the expected
+  location instead of moving relatively.
+
+
+7. UWP/Xbox build option
+------------------------
+
+Primary files:
+
+- meson_options.txt
+- meson.build
+
+Purpose:
+
+Add a build mode for UWP/Xbox-safe Windows API usage.
+
+What to port:
+
+- Add a boolean Meson option named "uwp".
+- Define CONFIG_UWP when the option is enabled.
+- Reject unsupported configurations early where possible.
+- Disable or avoid APIs that are unavailable in UWP packaged apps.
+- Reject DirectSound when explicitly enabled in UWP mode.
+- Avoid WHPX in UWP mode if it is not usable for the target package.
+- Avoid DBus display paths in UWP mode.
+- Avoid linking WinMM timer APIs in UWP mode.
+
+Typical configuration:
+
+  ../configure --enable-uwp --disable-sdl --disable-dsound --enable-xaudio2 --audio-drv-list=xaudio2
+
+Validation:
+
+- Confirm config-host.h contains CONFIG_UWP.
+- Confirm DirectSound is not linked in UWP mode.
+- Confirm winmm is not linked in UWP mode unless intentionally restored.
+
+
+8. Windows/UWP API compatibility guards
+---------------------------------------
+
+Primary files touched in this tree:
+
+- block/file-win32.c
+- block/meson.build
+- chardev/char-stdio.c
+- chardev/char-win.c
+- chardev/meson.build
+- io/channel-command.c
+- migration/exec.c
+- os-win32.c
+- util/coroutine-windows.c
+- util/qemu-thread-win32.c
+
+Purpose:
+
+Avoid Win32 APIs that can fail when QEMU is loaded from a UWP/Xbox package.
+
+What to port:
+
+- In block/file-win32.c:
+
+  - Avoid GetVersion usage.
+  - Avoid restricted DeviceIoControl paths.
+  - Avoid CD-ROM/host-device probing paths that are not valid in UWP.
+  - Force thread-based AIO.
+  - Reject native Win32 AIO in UWP mode.
+
+- In block/meson.build:
+
+  - Do not compile win32-aio.c for CONFIG_UWP builds.
+
+- In chardev code:
+
+  - Avoid Windows console/stdio implementations that depend on unavailable
+    console APIs.
+  - Return clean "not available" errors for unsupported stdio/console paths.
+
+- In io/channel-command.c:
+
+  - Stub or reject external command channels in UWP mode.
+
+- In migration/exec.c:
+
+  - Avoid GetSystemDirectoryA and external command execution assumptions.
+
+- In os-win32.c:
+
+  - Avoid SetConsoleCtrlHandler.
+  - Avoid timeGetDevCaps/timeBeginPeriod in UWP mode.
+
+- In util/coroutine-windows.c:
+
+  - Avoid direct imports of older Fiber APIs when they cause UWP load failures.
+  - Prefer dynamically resolved or UWP-compatible fiber APIs where possible.
+
+- In util/qemu-thread-win32.c:
+
+  - Avoid thread naming paths that LoadLibrary helper DLLs.
+  - Avoid OpenThread usage in UWP mode if unavailable.
+
+Validation:
+
+- Use dumpbin, llvm-objdump, or objdump to inspect imported symbols.
+- Compare imports against the Microsoft UWP allowed API list.
+- Confirm the DLL loads in the UWP/Xbox package before testing VM startup.
+
+
+9. SDL removal path
+-------------------
+
+Primary files:
+
+- meson.build
+- meson_options.txt
+- ui/host-display.c
+- audio/hostaudio.c
+- audio/xaudio2audio.c
+- system/host.c
+
+Purpose:
+
+Make SDL unnecessary for the UWP embedding path.
+
+What replaces SDL:
+
+- Video: host display backend.
+- Audio: host callback backend or XAudio2 backend.
+- Input: qemu_host_* input APIs.
+- Logs: host log callback.
+
+Recommended UWP/Xbox configuration:
+
+  ../configure --enable-uwp --disable-sdl --disable-dsound --enable-xaudio2 --audio-drv-list=xaudio2
+
+If the host wants to own audio playback itself:
+
+  ../configure --enable-uwp --disable-sdl --disable-dsound --audio-drv-list=host
+
+Validation:
+
+- Confirm SDL2.dll is not imported by qemu-system-*.dll.
+- Confirm the VM can start with -display host.
+- Confirm input works through host API calls.
+
+
+10. TAP networking stubs for Windows/UWP
+----------------------------------------
+
+Primary files:
+
+- net/meson.build
+- net/tap-stub.c
+
+Purpose:
+
+Prevent Unix/Linux TAP code from compiling on Windows/UWP and provide clean
+stubs for symbols referenced by common networking and virtio-net code.
+
+Problem solved:
+
+The Windows build attempted to compile net/tap.c and failed on Unix headers such
+as:
+
+  sys/ioctl.h
+
+What to port:
+
+- In net/meson.build:
+
+  - For Windows + UWP, select tap-stub.c.
+  - Do not compile Unix TAP source files.
+
+- In net/tap-stub.c, provide stubs for:
+
+  - net_init_tap
+  - tap_enable
+  - tap_disable
+  - tap_get_fd
+  - tap_get_vhost_net
+
+Validation:
+
+- Confirm net/tap.c is not compiled in Windows/UWP mode.
+- Confirm link errors for net_init_tap, tap_enable, and tap_disable are gone.
+- Confirm unsupported TAP configuration fails cleanly at runtime.
+
+
+11. Runtime DLL dependency collection
+-------------------------------------
+
+Primary file:
+
+- scripts/collect-win-dll-deps.py
+
+Purpose:
+
+Copy direct and indirect Windows DLL dependencies from the MSYS2/MinGW
+environment next to the installed QEMU DLLs.
+
+What to port:
+
+- Add a script that scans installed QEMU DLLs.
+- Use objdump or llvm-objdump to read DLL imports.
+- Search PATH plus optional extra directories.
+- Skip known Windows system DLLs.
+- Copy non-system dependency DLLs beside the QEMU DLLs.
+- Hook the script into Meson install logic after QEMU DLLs are installed.
+
+Dependencies typically handled this way:
+
+- glib
+- pixman
+- zlib
+- gnutls
+- libpng
+- libusb
+- slirp
+- ncurses, if still linked
+- other MSYS2/MinGW runtime DLLs
+
+Important note:
+
+This packaging model intentionally keeps dependencies as separate DLLs. They
+are not merged into qemu-system-*.dll.
+
+Validation:
+
+- Install the build.
+- Confirm dependent DLLs appear beside qemu-system-*.dll.
+- Confirm the UWP package includes those DLLs.
+- Confirm LoadPackagedLibrary can load dependencies before loading the main
+  QEMU DLL.
+
+
+12. Build usage summary
+-----------------------
+
+Typical UWP/Xbox DLL-oriented build:
+
+  ../configure --enable-uwp --disable-sdl --disable-dsound --enable-xaudio2 --audio-drv-list=xaudio2
+
+If the host callback audio backend is also needed:
+
+  ../configure --enable-uwp --disable-sdl --disable-dsound --enable-xaudio2 --audio-drv-list=xaudio2,host
+
+If the host wants callback audio only:
+
+  ../configure --enable-uwp --disable-sdl --disable-dsound --audio-drv-list=host
+
+Typical runtime video:
+
+  -display host
+
+Typical runtime XAudio2 audio:
+
+  -audiodev xaudio2,id=audio0
+
+Typical runtime host callback audio:
+
+  -audiodev host,id=audio0
+
+Typical runtime absolute mouse device:
+
+  -device usb-tablet
+
+
+13. Validation checklist
+------------------------
+
+Build validation:
+
+- qemu-system-*.dll is produced.
+- qemu-system-*.exe is not required for the embedding path.
+- CONFIG_UWP is defined when --enable-uwp is used.
+- SDL is not imported when --disable-sdl is used.
+- DirectSound is not imported when --disable-dsound is used.
+- XAudio2 links through xaudio2_9 when --enable-xaudio2 is used.
+- net/tap.c is not compiled in Windows/UWP mode.
+- tap-stub.c provides all required TAP symbols.
+- qapi generated code includes host and xaudio2 audio drivers.
+- audio_create_pdos handles host and xaudio2.
+- audio_get_pdo_out and audio_get_pdo_in handle host and xaudio2.
+
+Runtime loading validation:
+
+- All non-system dependency DLLs are packaged beside qemu-system-*.dll.
+- LoadPackagedLibrary loads dependency DLLs.
+- LoadPackagedLibrary loads qemu-system-*.dll.
+- No missing import causes Win32 error 127.
+- The DLL does not terminate the host process during initialization failure.
+
+Video validation:
+
+- -display host starts without SDL.
+- The host receives framebuffer callbacks.
+- BIOS/VGA text-to-graphics transition still produces frames.
+
+Input validation:
+
+- Keyboard events enter through the host API.
+- Relative mouse events work when using a relative pointer device.
+- Absolute mouse events work when using usb-tablet or another absolute pointer
+  device.
+- qemu_host_pointer_is_absolute() reports the expected state.
+
+Audio validation:
+
+- -audiodev host sends PCM buffers to the host callback.
+- -audiodev xaudio2 creates XAudio2 mastering/source voices.
+- Guest audio device plays through the selected audiodev.
+- SDL and DirectSound are not required for audio.
+
+
+14. Common porting errors and fixes
+-----------------------------------
+
+Problem:
+
+  net/tap.c fails to compile on Windows with sys/ioctl.h missing.
+
+Fix:
+
+  Ensure Windows/UWP builds select tap-stub.c instead of Unix TAP sources.
+
+Problem:
+
+  Undefined references to net_init_tap, tap_enable, or tap_disable.
+
+Fix:
+
+  Add high-level TAP stubs to net/tap-stub.c.
+
+Problem:
+
+  AUDIODEV_DRIVER_HOST or AUDIODEV_DRIVER_XAUDIO2 warnings in audio switches.
+
+Fix:
+
+  Update audio_create_pdos, audio_get_pdo_out, and audio_get_pdo_in.
+
+Problem:
+
+  error_setg is implicitly declared in a new audio backend.
+
+Fix:
+
+  Include qapi/error.h.
+
+Problem:
+
+  XAudio2 callback vtable assignment discards const.
+
+Fix:
+
+  Use a non-const IXAudio2VoiceCallbackVtbl object, matching the MinGW XAudio2
+  header's lpVtbl type.
+
+Problem:
+
+  The guest ignores absolute mouse coordinates.
+
+Fix:
+
+  Add an absolute pointing device, such as -device usb-tablet, and verify with
+  qemu_host_pointer_is_absolute().
+
+
+15. Final design notes
+----------------------
+
+This work does not make every QEMU subsystem fully UWP-native. It provides an
+embedding layer and removes the main assumptions that made the DLL unusable in a
+UWP/Xbox host:
+
+- process-owned desktop UI
+- SDL window ownership
+- console-dependent logging and stdio
+- DirectSound-only Windows audio
+- unrestricted Win32 API imports
+- executable-only build outputs
+
+When porting to a newer QEMU version, keep the architecture the same even if
+individual source files have changed. The important part is the boundary:
+
+- QEMU runs inside a host-controlled DLL.
+- The host owns rendering, input dispatch, packaging, and lifecycle control.
+- QEMU exposes explicit callbacks and API calls instead of controlling the
+  process as a standalone desktop executable.
+
+
+16. shadPS4 callback bridge completion (13/07/2026)
+-----------------------------------------------------
+
+The shadPS4 machine now exercises the public callback boundary directly:
+
+- system/host.c owns thread-safe log, video, and audio callback slots.
+- The minimal Liverpool processor copies and validates guest framebuffers,
+  then emits width, height, pitch, format, and pixels to the video callback.
+- The initial AudioOut HLE device validates and copies guest PCM blocks, then
+  emits size, rate, channel count, format, and samples to the audio callback.
+- Internal DLL users use plain declarations, avoiding MinGW __imp_* imports
+  back into the DLL that defines the exported API.
+- The functional test validates both callbacks byte-for-byte after loading the
+  stripped DLL.
+
+This is the embedding transport, not the end of the media implementation. The
+GPU still needs broader PM4 semantics and rendering, while AudioOut still needs
+timed queues connected to the existing XAudio2 backend. The callback transport
+must remain available for UWP hosts that own presentation and audio playback.
+
+
+17. XAudio2 WinRT initialization and host services (13/07/2026)
+----------------------------------------------------------------
+
+The XAudio2 backend now initializes its WinRT apartment with RoInitialize using
+RO_INIT_MULTITHREADED. This fixes HRESULT 0x800401f0 when the embedding process
+has not initialized WinRT before loading QEMU. Successful initialization is
+balanced with RoUninitialize; RPC_E_CHANGED_MODE keeps the host's apartment.
+CoInitialize was not introduced.
+
+The shadPS4 AudioOut service can bind to:
+
+  -audiodev xaudio2,id=shadps4
+
+PCM is queued through QEMU's AudioBackend with bounded buffering, per-channel
+volume, mute, drain/status operations, and orderly voice shutdown. The public
+audio callback remains active for hosts that own playback.
+
+The embedding API also gained versioned storage callbacks and complete input
+transport for indexed gamepads, touch, motion, AudioIn, rumble, and lightbar.
+Storage paths remain virtual; the UWP application maps approved mounts to its
+ApplicationData folders and enforces title-specific persistence.
+
+
+18. Phase 7 host services completion (13/07/2026)
+---------------------------------------------------
+
+The shadPS4 execute mode now requires a machine title-id (1..32 uppercase
+letters, digits, underscore, or hyphen). Every approved guest storage path is
+scoped to /titles/<TITLE_ID>/ before it reaches the host callback. The core
+enforces /app0 as read-only and continues rejecting traversal and host paths.
+
+Storage callbacks version 2 append seek, stat, mkdir, unlink, rename, flush,
+readdir, atomic_replace, and cleanup without breaking the version 1 prefix.
+The HLE layer maps the corresponding FreeBSD-style syscalls and closes opaque
+storage handles on guest exit, fault, reset, and finalization. Temporary title
+mounts are released through an idempotent cleanup callback.
+
+The host dialog bridge uses asynchronous request IDs. /dev/dialog writes emit a
+request callback; qemu_host_complete_dialog places a bounded response into the
+guest-readable queue. This keeps CoreDispatcher/DispatcherQueue ownership in
+the UWP application.
+
+Network access is callback-only. The host grants INTERNET_CLIENT and, when the
+package manifest permits it, PRIVATE_CLIENT. Public IPv4 connect requires the
+first capability; loopback/private/link-local destinations additionally require
+the second. No TAP, direct WinSock ownership, or desktop network API was added.
+
+Recommended UWP mapping:
+
+- INTERNET_CLIENT -> internetClient manifest capability.
+- PRIVATE_CLIENT -> privateNetworkClientServer manifest capability.
+- /data -> ApplicationData LocalFolder under the title ID.
+- /temp and /temp0 -> TemporaryFolder under the title ID.
+- Dialog requests -> UI thread, completed by request ID.
+
+The functional TCG test validates storage metadata and directory operations,
+atomic saves, /app0 protection, temporary cleanup, asynchronous dialogs, public
+network send/receive, and rejection of private IPv4 without capability. It runs
+with both the none and XAudio2 audio backends.
+
+UWP builds also use a neutral relocatable C:/qemu prefix and GCC
+-ffile-prefix-map for both source and build roots. The DLL is not
+post-processed with strip; build-path removal must come from compiler/linker
+configuration while runtime data and configuration directories stay relocatable.
+
+
+19. PS4 hardware profiles (13/07/2026)
+---------------------------------------
+
+The machine now exposes variant=base for PS4 Liverpool/base and variant=neo
+for PS4 Pro Neo. Both remain part of the same shadps4 target and DLL.
+
+The guest CPU profile identifies as AuthenticAMD Family 16h Model 00h,
+AMD Jaguar, with one package, eight cores, and one thread per core. The machine
+requires all eight CPUs. The functional guest verifies the vendor, signature,
+and logical processor count with CPUID.
+
+TCG remains the supported default execution path. The machine does not hardcode
+the accelerator, preserving an optional native path for hosts/builds that can
+provide one. Runtime logging reports the selected execution class.
+
+
+20. Five largest residual HLE blocks (14/07/2026)
+--------------------------------------------------
+
+The five modules with the largest number of missing registrations were added:
+
+- libSceUsbd: 61 unique NIDs.
+- libSceCamera: 50 unique NIDs.
+- libSceNpManager: 44 unique NIDs and 51 registrations including aliases.
+- libSceHmd: 25 unique NIDs.
+- libSceAudio3d: 22 unique NIDs.
+
+This batch covers 202 unique NIDs and 209 reference registrations. The
+remaining source-wide inventory is 183 unique NIDs (190 registrations). The
+inventory is generated from literal LIB_FUNCTION registrations in shadPS4 and
+compared with the explicit QEMU maps plus modules with an intentional generic
+provider.
+
+The implementations live in:
+
+- hw/i386/shadps4-services3.inc.c: service behavior and ABI handling.
+- hw/i386/shadps4-hle.h: dispatch IDs and persistent state.
+- hw/i386/shadps4-hle.c: service object types, reset, and dispatch routing.
+- hw/i386/shadps4.c: explicit NID maps and legacy-stub fallthrough.
+
+UWP behavior is deliberate:
+
+- Usbd has initialization, empty device enumeration, opaque transfers, setup
+  packet construction, event synchronization calls, and deterministic
+  NO_DEVICE errors. It does not link libusb or desktop USB/device APIs.
+- NpManager uses the 0x20000001 request-ID range, tracks synchronous and
+  asynchronous requests, abort/wait/timeout state, signed-out identity, plus
+  and reachability state, and callback registration without desktop services.
+- Camera tracks handles and lifecycle, reports no attached camera, and returns
+  NOT_CONNECTED for physical capture/configuration operations.
+- Hmd tracks initialization and handles, writes NOT_DETECTED device metadata,
+  exposes the shadPS4 distortion/reprojection memory constants, and reports a
+  disconnected physical headset.
+- Audio3d tracks ports, queue depth, objects, bed writes, attributes and flush
+  state. Its 32-byte open-parameter ABI and capability-list ABI match shadPS4.
+  Direct AudioOut bridging returns NOT_SUPPORTED until a mixed 3D stream is
+  available; it does not falsely report successful playback.
+
+New dispatch values were appended after the existing enum, including
+SHADPS4_HLE_SUCCESS, so no pre-existing guest syscall number changed. Explicit
+maps return only for recognized NIDs; unknown NIDs continue to the legacy stub
+lists.
+
+Rebuild and test from an MSYS2 UCRT64 shell:
+
+  cd /c/Users/user1/qemu-11
+  ninja -C build-shadps4-check qemu-system-shadps4.dll
+  python tests/shadps4/test_loader.py \
+    build-shadps4-check/qemu-system-shadps4.dll
+
+The functional suite includes one direct dispatch/error test for every new
+module. It also preserves all previous Liverpool/base, Neo, TCG, embedding,
+storage, input, display, audio, network, loader and TLS tests.
+
+Before packaging, inspect imports and embedded paths without modifying the DLL:
+
+  objdump -p build-shadps4-check/qemu-system-shadps4.dll
+  strings build-shadps4-check/qemu-system-shadps4.dll | \
+    grep -E 'C:/Users/|C:\\Users\\|qemu_host_start_with_args'
+
+The final strings command must print nothing. Do not add, export, call, or
+document qemu_host_start_with_args; lifecycle remains qemu_host_init,
+qemu_host_main_loop_step, qemu_host_request_shutdown, and qemu_host_cleanup.
+
+21. Five largest remaining HLE blocks
+=====================================
+
+This batch replaces 69 residual provider registrations (67 unique NIDs) with
+stateful dispatch for the five libraries that had the largest unsupported
+sets: libScePlayGo (15), libSceNpWebApi2 push events (15), libSceNpAuth (14
+registrations/12 unique NIDs), libSceIme (13), and libSceNpTrophy (12).
+
+- PlayGo validates initialization memory, tracks handle, speed and language,
+  and reports package chunks as locally installed. It does not access desktop
+  paths or registry APIs.
+- WebApi2 push events reuse HTTP/WebApi context ownership and add UWP-safe
+  handles, filters, callbacks, opaque push-context IDs, timeout and abort state.
+- NpAuth follows the 0x10000001 request-ID ABI, the 16-request limit and
+  sync/async completion state. Offline requests return SIGNED_OUT or
+  USER_NOT_FOUND and never fabricate authorization codes or identity tokens.
+- IME validates the 96-byte parameter ABI, UTF-16 buffers, caret and panel
+  geometry, plus physical-keyboard lifecycle. With no attached keyboard it
+  returns CONNECTION_FAILED instead of importing a desktop UI backend.
+- Trophy tracks context/handle registration and a 128-bit unlock mask. It
+  exposes deterministic structural metadata and explicit ICON_NOT_FOUND for
+  assets that are not present; no fake icon or online trophy data is created.
+
+All new ShadPS4HLEFunction values are appended after AUDIO3D_END. Existing
+dispatch numbers therefore remain stable. The implementation lives in
+hw/i386/shadps4-services4.inc.c and is included by shadps4-hle.c.
+
+Validation after rebuilding:
+
+  ninja -C build-shadps4-check qemu-system-shadps4.dll
+  python tests/shadps4/test_loader.py \
+    build-shadps4-check/qemu-system-shadps4.dll
+
+Do not post-process the DLL with strip. Validate the linked artifact directly.
+
+After this batch, the provider audit has 121 registrations / 116 unique NIDs
+remaining outside these five blocks.
+
+22. shadPS4 correctness and UWP audit
+======================================
+
+The full qemu-system-shadps4 path was reviewed after the residual-NID closure.
+The review combined source invariants, GCC -fanalyzer, a warning-clean
+incremental link, and PE import/export inspection. The former Phase 7 and
+external-title validation procedures are retired.
+
+Correctness fixes:
+
+- Videodec now keeps input, framebuffer and picture structures in independent
+  buffers, validates both Decode structure sizes, rejects negative or excessive
+  dimensions/DPB counts, and checks the resource-size multiplication before it
+  can overflow.
+- sceRandomGetRandomNumber now returns the documented 0x817c0016 invalid-
+  argument error instead of the unrelated 0x817c0001 value.
+- console writes consume and validate the full guest range in bounded chunks;
+  requests larger than 256 bytes are no longer silently truncated. Read/write
+  ranges that wrap UINT64_MAX are rejected.
+- GPU queue doorbells now reconstruct wrapped ring contents into one contiguous
+  PM4 stream. A packet crossing the ring boundary is parsed and committed once,
+  rather than being split into two invalid submissions.
+- shadPS4 I/O reset no longer dereferences or clears audio_queue before the null
+  guard, and no longer clears the same queue twice.
+
+UWP import fixes:
+
+- qemu_set_tty_echo is a deliberate no-op under CONFIG_UWP, removing
+  GetConsoleMode and SetConsoleMode from the DLL.
+- host CD-ROM enumeration/device probing is disabled under CONFIG_UWP, removing
+  GetLogicalDriveStrings and GetDriveType. Guest storage remains available
+  through the embedding callbacks.
+
+Regression coverage was added for the exact Random error and bounded Videodec
+resource query. Validate the unmodified linked DLL; do not use strip or the
+retired Phase 7/external-title workflows.
+
+
+20. Brokered WinRT storage ABI (15/07/2026)
+============================================
+
+This section supersedes the earlier delivery/test workflow. The DLL is no
+longer post-processed with strip, and validation no longer uses the previous
+Phase 7 suite or external title directories.
+
+Public API added in include/qemu/qemu-host.h:
+
+  qemu_host_register_brokered_storage_callbacks
+  qemu_host_mount_brokered_file
+  qemu_host_mount_brokered_folder
+  qemu_host_unmount_brokered_storage
+
+The host passes opaque WinRT ABI pointers for StorageFile, StorageFolder and
+IRandomAccessStream. QEMU retains/releases them through host callbacks and does
+not invoke WinRT directly. File operations are translated by the synchronous
+QemuHostBrokeredStorageCallbacks vtable. The host is responsible for apartment
+ownership and for bridging asynchronous WinRT operations away from the UI
+thread.
+
+Virtual mount paths are absolute UTF-8 paths with '/' separators. Empty, '.',
+'..', trailing-slash and backslash components are rejected. Folder mounts map a
+relative tree; file mounts map exactly one path; longest mount prefix wins.
+Mount registration is serialized with qemu_host_init and becomes immutable as
+soon as initialization starts.
+
+system/host.c now routes open/read/write/seek/close/stat/mkdir/unlink/rename,
+flush/readdir/atomic-replace/cleanup/truncate to the matching brokered mount.
+Backend handles are wrapped in a private handle namespace. Cleanup closes any
+remaining backend handles and releases every mounted WinRT object.
+
+hw/i386/shadps4-loader.c opens brokered eboot/PRX/SELF images through the host
+storage layer. hw/i386/shadps4.c enumerates sce_module through open_at/readdir
+and keeps virtual paths platform-independent, avoiding Windows backslashes.
+
+Focused regression coverage:
+
+  python tests/shadps4/test_brokered_storage.py \
+    --dll build-shadps4-check/qemu-system-shadps4.dll
+
+The test serves a minimal Orbis ELF from an opaque file/stream mount, enumerates
+sce_module through an overlapping folder mount, and verifies open_file,
+open_at, read, seek, close, retain and release. Result: PASS.
+
+Final linked DLL, without strip:
+
+  size: 9807119 bytes
+  SHA-256: 72194ACC7956E90BF0A8DBA617B3E866405DD847AF38E08E38720D2782A93624
+  brokered exports present: 4/4

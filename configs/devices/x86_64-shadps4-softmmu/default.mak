@@ -1,0 +1,8 @@
+# Hybrid shadPS4 machine only. Do not pull in generic PC boards.
+CONFIG_I440FX=n
+CONFIG_ISAPC=n
+CONFIG_Q35=n
+CONFIG_MICROVM=n
+CONFIG_NITRO_ENCLAVE=n
+
+CONFIG_SHADPS4_MACHINE=y

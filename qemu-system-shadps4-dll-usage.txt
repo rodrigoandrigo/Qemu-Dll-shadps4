@@ -1,0 +1,1236 @@
+GUIA DE USO DA qemu-system-shadps4.dll
+======================================
+
+Versao deste documento: 15/07/2026
+
+1. OBJETIVO
+===========
+
+qemu-system-shadps4.dll e uma versao embutivel do QEMU para a maquina hibrida
+PS4 Liverpool/base e PS4 Pro Neo. Ela nao e um executavel e nao deve ser
+iniciada como um programa de console. O aplicativo host carrega a DLL, registra
+callbacks, fornece um argv para qemu_host_init() e controla o loop do QEMU.
+
+O build atual possui:
+
+  - target x86_64-shadps4-softmmu;
+  - maquina unica: shadps4;
+  - CPU AMD Jaguar modelada com 8 nucleos;
+  - execucao por TCG;
+  - variantes base/Liverpool e neo/PS4 Pro;
+  - loader ELF/SELF Orbis e modulos PRX/SPRX;
+  - HLE e linker de NIDs;
+  - display embutido por callback;
+  - audio por callback e backend XAudio2;
+  - teclado, mouse relativo/absoluto, gamepad, touch, movimento e microfone;
+  - storage legado por path e storage UWP brokered por StorageFile,
+    StorageFolder e IRandomAccessStream;
+  - callbacks para dialogs, rede, HTTP, media, launch e HLE externo;
+  - suporte ao ambiente UWP.
+
+O header publico e:
+
+  include/qemu/qemu-host.h
+
+A biblioteca de importacao MinGW gerada junto da DLL e:
+
+  build-shadps4-check/qemu-system-shadps4.dll.a
+
+Projetos MSVC/UWP normalmente devem carregar a DLL com LoadPackagedLibrary e
+resolver as funcoes com GetProcAddress, ou gerar uma .lib compativel a partir
+dos exports. O arquivo .dll.a e destinado ao linker MinGW.
+
+
+2. EMPACOTAMENTO UWP
+====================
+
+Inclua qemu-system-shadps4.dll no pacote do aplicativo. Inclua tambem as
+dependencias nao pertencentes ao Windows usadas pelo build final:
+
+  libgcc_s_seh-1.dll
+  libwinpthread-1.dll
+  libglib-2.0-0.dll
+  libgmodule-2.0-0.dll
+  libpixman-1-0.dll
+  zlib1.dll
+
+Dependencias transitivas dessas bibliotecas tambem precisam estar no pacote.
+Use objdump -p em cada DLL para conferir a arvore efetiva do build distribuido.
+xaudio2_9.dll e APIs api-ms-win-* sao fornecidas pelo sistema operacional.
+
+Carregamento UWP:
+
+  HMODULE module = LoadPackagedLibrary(L"qemu-system-shadps4.dll", 0);
+  if (!module) {
+      DWORD error = GetLastError();
+      /* Registrar e tratar o erro no aplicativo. */
+  }
+
+Depois, use GetProcAddress para cada funcao necessaria e valide todos os
+ponteiros antes de iniciar o QEMU.
+
+Nao carregue DLLs diretamente de caminhos arbitrarios externos ao pacote. Para
+um titulo escolhido pelo usuario, obtenha StorageFile/StorageFolder pelo picker
+e monte o objeto concedido na camada brokered antes de inicializar o QEMU.
+
+
+3. LAYOUT DO TITULO
+===================
+
+O argumento -kernel aponta para o arquivo principal. O loader procura modulos
+automaticamente na pasta sce_module ao lado desse arquivo:
+
+  <TitleRoot>/
+    eboot.bin
+    sce_module/
+      libc.prx
+      libSceFios2.prx
+      outros_modulos.prx
+      outros_modulos.sprx
+
+Todos os arquivos .prx e .sprx da pasta sao enumerados, ordenados, carregados
+em bases individuais e ligados ao eboot e ao HLE.
+
+Os arquivos precisam estar descriptografados e em um formato ELF/SELF Orbis
+aceito pelo loader. SELF criptografado, segmento comprimido nao suportado,
+firmware oficial ausente ou arquivo corrompido deve resultar em erro limpo, e
+nao deve ser tratado como uma imagem valida.
+
+O caminho de -kernel pode ser um caminho brokered, por exemplo
+/brokered/title/eboot.bin. Nesse caso, tanto a abertura inicial quanto a pasta
+sce_module passam pelos callbacks brokered; o QEMU nao precisa conhecer nem
+receber o caminho fisico do arquivo escolhido pelo usuario.
+
+
+4. ARGUMENTOS ACEITOS E RECOMENDADOS
+====================================
+
+Os argumentos sao enviados diretamente para qemu_host_init(argc, argv). argv[0]
+deve existir e pode ser a string "qemu-system-shadps4".
+
+Exemplo recomendado para PS4 base com video por callback e audio XAudio2:
+
+  qemu-system-shadps4
+  -M shadps4,variant=base,execute=on,title-id=CUSA00000
+  -accel tcg,thread=single
+  -smp 8
+  -m 5248M
+  -display host
+  -audiodev xaudio2,id=shadps4
+  -nodefaults
+  -kernel C:/UwpAccessible/Title/eboot.bin
+
+Exemplo para PS4 Pro:
+
+  -M shadps4,variant=neo,execute=on,title-id=CUSA00000
+
+Exemplo sem saida de audio do sistema, mantendo o callback PCM:
+
+  -audiodev none,id=shadps4
+
+Exemplo sem display, util para teste automatizado:
+
+  -display none
+
+Opcoes da maquina:
+
+  -M shadps4
+      Seleciona a unica maquina deste target.
+
+  variant=base
+      PS4 Liverpool/base. E o valor padrao.
+
+  variant=neo
+      PS4 Pro/Neo.
+
+  execute=on
+      Carrega o processo Orbis, prepara long mode e executa a imagem.
+      Exige title-id e -kernel.
+
+  execute=off
+      Carrega a maquina sem iniciar o processo. E o valor padrao e serve para
+      diagnostico estrutural.
+
+  title-id=IDENTIFICADOR
+      Obrigatorio quando execute=on. Aceita de 1 a 32 caracteres, somente A-Z,
+      0-9, sublinhado e hifen. Para jogos reais, use o identificador PS4 normal
+      de 9 caracteres, por exemplo CUSA00000.
+
+Opcoes gerais aceitas neste build:
+
+  -kernel <caminho>
+      Define eboot.bin/ELF/SELF principal.
+
+  -accel tcg,thread=single
+      Caminho validado e recomendado. O build final atual possui CONFIG_TCG e
+      nao possui outro acelerador compilado.
+
+  -smp 8
+      A maquina exige exatamente 8 CPUs. Valores diferentes nao sao validos.
+
+  -m <tamanho>
+      RAM do guest. O padrao da maquina e 5248 MiB. Imagens pequenas sinteticas
+      funcionam com 64M, mas jogos reais precisam de memoria suficiente para o
+      eboot, todos os modulos, HLE, TLS, stacks e buffers.
+
+  -display host
+      Envia superficies graficas para QemuHostVideoCallback. O listener inclui
+      o console 0 mesmo antes de ele se tornar grafico.
+
+  -display none
+      Desabilita a entrega de display. Aceitavel para testes sem UI.
+
+  -audiodev xaudio2,id=shadps4
+      Usa XAudio2 2.9 para reproducao. O id deve ser shadps4 porque o dispositivo
+      de I/O interno procura esse backend.
+
+  -audiodev none,id=shadps4
+      Descarta a reproducao local. O caminho HLE ainda pode emitir PCM para o
+      callback de audio registrado.
+
+  -nodefaults
+      Recomendado. Evita tentar criar dispositivos genericos nao usados pela
+      maquina PS4.
+
+  -d <itens>
+      Logging QEMU. Exemplos aceitaveis: guest_errors,unimp,in_asm. in_asm gera
+      grande volume de dados e deve ser reservado para diagnostico.
+
+  -D <arquivo>
+      Arquivo de log. Em UWP, use somente caminho gravavel permitido, como
+      ApplicationData LocalFolder. Para uso normal, prefira o callback de log.
+
+Opcoes que nao devem ser usadas neste target:
+
+  - maquinas pc, q35, isapc ou microvm;
+  - quantidade de CPU diferente de 8;
+  - TAP ou backends de rede que dependam de registry/device Win32;
+  - SDL, GTK, DirectSound, WinMM ou displays desktop;
+  - serial, parallel, floppy, CD-ROM e dispositivos PC genericos;
+  - -nographic quando ele implicar uso de console Win32;
+  - caminhos de host fora das permissoes do pacote UWP;
+  - opcoes de acelerador que nao estejam presentes no build;
+  - argumentos desconhecidos ou copiados de um qemu-system-x86_64 completo.
+
+
+5. ORDEM DE INICIALIZACAO
+=========================
+
+Ordem recomendada:
+
+  1. Carregar a DLL e resolver os exports.
+  2. Registrar callback de log.
+  3. Registrar callback HLE externo, se usado. Ele deve ser registrado antes de
+     qemu_host_init para que imports externos entrem na imagem HLE.
+  4. Registrar video, audio, pad output, storage, dialogs, rede, HTTP, media e
+     launch. Registrar antes do init evita perder eventos iniciais.
+  5. Montar argc/argv com strings validas.
+  6. Chamar qemu_host_init.
+  7. Escolher exatamente um modo de loop: thread interna ou step.
+  8. Enviar input somente depois de init bem-sucedido.
+  9. Solicitar shutdown.
+ 10. Aguardar o loop terminar.
+ 11. Chamar qemu_host_cleanup.
+
+O ciclo atual e de uma unica inicializacao por processo. cleanup libera o QEMU
+e remove callbacks, mas qemu_host_init nao deve ser chamado novamente na mesma
+instancia de processo. Para uma nova sessao completa, reinicie o processo host.
+
+
+6. MODO DE LOOP COM THREAD INTERNA
+==================================
+
+Use quando o QEMU deve executar em uma thread propria:
+
+  int rc = qemu_host_init(argc, argv);
+  if (rc < 0) {
+      /* Falha de inicializacao. */
+  }
+
+  rc = qemu_host_start();
+  if (rc < 0) {
+      /* O loop nao iniciou. */
+  }
+
+  /* A UI continua em sua propria thread. */
+
+  qemu_host_request_shutdown();
+
+  int exit_status = 0;
+  qemu_host_join(&exit_status);
+  qemu_host_cleanup();
+
+qemu_host_join bloqueia ate a thread do QEMU terminar. Nao o execute na thread
+de UI se o shutdown ainda nao foi solicitado ou se o guest puder demorar para
+encerrar.
+
+
+7. MODO DE LOOP POR STEP
+========================
+
+Use quando o host quer controlar cada iteracao. Nao chame qemu_host_start nesse
+modo:
+
+  int exit_status = 0;
+  int rc;
+
+  do {
+      rc = qemu_host_main_loop_step(true, &exit_status);
+      if (rc < 0) {
+          /* Erro de estado. */
+          break;
+      }
+      /* rc == 0: ainda executando; rc == 1: loop encerrado. */
+  } while (rc == 0);
+
+  qemu_host_cleanup();
+
+nonblocking=true retorna depois de uma iteracao sem esperar indefinidamente.
+nonblocking=false permite que a iteracao aguarde eventos. Para integrar com um
+dispatcher de UI, use true e programe novas iteracoes sem bloquear a UI.
+
+Os modos thread e step sao mutuamente exclusivos. main_loop_step retorna erro
+se a thread criada por qemu_host_start existir.
+
+
+8. API PUBLICA DE CICLO DE VIDA
+===============================
+
+  int qemu_host_init(int argc, char **argv)
+      Inicializa o QEMU e a maquina. Retorna 0 em sucesso, -EINVAL para entrada
+      invalida e -EBUSY se ja inicializado.
+
+  int qemu_host_start(void)
+      Cria a thread interna do loop. Retorna 0, -EINVAL ou -EBUSY.
+
+  int qemu_host_main_loop_step(bool nonblocking, int *exit_status)
+      Executa uma iteracao. Retorna 0 enquanto ativo, 1 quando encerrado, ou
+      valor negativo em erro.
+
+  int qemu_host_request_shutdown(void)
+      Enfileira shutdown e acorda o loop. Nao encerra o processo host.
+
+  int qemu_host_reset(void)
+      Enfileira reset da maquina e acorda o loop.
+
+  int qemu_host_join(int *exit_status)
+      Aguarda a thread criada por qemu_host_start e devolve o status.
+
+  int qemu_host_cleanup(void)
+      Libera recursos. So e valido depois que o loop e a thread terminaram.
+
+  bool qemu_host_is_initialized(void)
+      Indica init concluido e cleanup ainda nao executado.
+
+  bool qemu_host_is_running(void)
+      Indica thread/step ativo naquele momento.
+
+  int qemu_host_get_exit_status(void)
+      Retorna o ultimo status de saida armazenado.
+
+  int qemu_host_get_last_fault(QemuHostFaultInfo *info)
+      Copia o ultimo fault estruturado da maquina shadPS4. Antes da chamada,
+      preencha info->size com sizeof(QemuHostFaultInfo) e info->version com
+      QEMU_HOST_FAULT_INFO_VERSION. Retorna 0 em sucesso, -ENOENT quando nao
+      houve fault desde qemu_host_init, ou -EINVAL para ABI/tamanho invalido.
+      O snapshot permanece disponivel depois do shutdown e cleanup, ate o
+      proximo qemu_host_init.
+
+      O snapshot contem vetor/tipo/codigo da excecao; RIP, RSP, RBP, CR2, CR3
+      e RFLAGS; endereco de retorno; ate 16 bytes da instrucao; imagem do RIP;
+      CPU, processo e thread guest; e numero, NID, biblioteca, modulo e sete
+      argumentos do ultimo syscall/HLE. Tambem inclui o retorno da ultima HLE
+      e RAX, RBX, RCX, RDX, RSI, RDI e R8-R15. O app UWP pode apresentar estes
+      campos diretamente na aba Errors sem analisar texto de log.
+
+      Os campos novos foram anexados ao fim da estrutura. Hosts compilados com
+      o layout anterior continuam aceitos pelo campo size; hosts novos devem
+      sempre usar sizeof(QemuHostFaultInfo).
+
+
+9. CALLBACKS DE SAIDA
+=====================
+
+Log:
+
+  qemu_host_register_log_callback(callback, opaque)
+  qemu_host_log_callback_enabled()
+  qemu_host_emit_log(level, message)
+
+Niveis: ERROR=0, WARNING=1, INFO=2, DEBUG=3. O callback deve copiar a mensagem
+se quiser usa-la depois do retorno. Nao dependa de stdout/stderr em UWP.
+
+Video:
+
+  qemu_host_register_video_callback(callback, opaque)
+
+O callback recebe pixels, width, height, stride e formato. Formatos existentes:
+
+  UNKNOWN=0
+  BGRA8888=1
+  RGBA8888=2
+  RGBX8888=3
+  BGRX8888=4
+
+O ponteiro de pixels pertence ao QEMU e so deve ser usado durante o callback.
+Copie o frame para memoria do host ou para um recurso grafico antes de retornar.
+stride pode ser maior que width * 4.
+
+Audio:
+
+  qemu_host_register_audio_callback(callback, opaque)
+
+Recebe samples, tamanho em bytes, sample_rate, channels e formato:
+
+  U8=0
+  S16=1
+  S32=2
+  F32=3
+
+O buffer pertence ao QEMU durante o callback. Copie ou envie imediatamente ao
+pipeline de audio.
+
+Saida do controle:
+
+  qemu_host_register_pad_output_callback(callback, opaque)
+
+Recebe controller e QemuHostPadOutput com rumble pequeno/grande e RGB da
+lightbar.
+
+As funcoes qemu_host_emit_log, qemu_host_emit_video_frame,
+qemu_host_emit_audio_frame e qemu_host_emit_pad_output tambem sao exports. Elas
+sao utilitarios de encaminhamento e teste. Um host normal registra callbacks e
+nao precisa chama-las; chama-las nao substitui a execucao do guest.
+
+
+10. INPUT
+=========
+
+Teclado:
+
+  qemu_host_send_key_number(key_number, down)
+  qemu_host_send_key_qcode(qcode, down)
+
+key_number deve corresponder a uma tecla QEMU valida. qcode usa o enum QKeyCode
+do QAPI compilado. Envie down=true ao pressionar e down=false ao liberar.
+
+Mouse:
+
+  qemu_host_send_pointer_rel(dx, dy)
+  qemu_host_send_pointer_abs(x, y, width, height)
+  qemu_host_send_pointer_button(button, down)
+  qemu_host_capture_pointer_abs()
+  qemu_host_pointer_is_absolute()
+
+send_pointer_abs captura automaticamente um dispositivo absoluto quando
+necessario, limita x/y ao retangulo 0..width e 0..height e sincroniza o evento.
+width e height devem ser maiores que zero.
+
+Botoes:
+
+  LEFT=0, MIDDLE=1, RIGHT=2, WHEEL_UP=3, WHEEL_DOWN=4,
+  SIDE=5, EXTRA=6.
+
+Gamepad:
+
+  qemu_host_send_gamepad_state(controller, &state)
+
+Controllers validos: 0 a 4. A estrutura contem buttons, sticks assinados de
+16 bits, triggers de 8 bits, connected e timestamp_ns.
+
+Touch:
+
+  qemu_host_send_touch_state(controller, &state)
+
+Cada controle possui no maximo dois pontos. x e y sao normalizados de 0.0 a
+1.0. Valores fora do intervalo sao limitados e valores nao finitos viram zero.
+
+Movimento:
+
+  qemu_host_send_motion_state(controller, &state)
+
+Fornece aceleracao[3], velocidade_angular[3], orientacao[4] e timestamp_ns.
+Valores nao finitos sao substituidos por zero.
+
+Entrada de audio/microfone:
+
+  qemu_host_send_audio_input(samples, size, rate, channels, format)
+
+Limites: 1 MiB por chamada, 8000..192000 Hz, 1..8 canais e frame PCM completo.
+size deve ser multiplo de bytes_por_amostra * canais.
+
+Funcoes de input retornam -ENODEV quando a maquina/dispositivo correspondente
+nao esta registrado, e -EINVAL para estado ou parametro invalido.
+
+
+11. STORAGE E ARQUIVOS BROKERED UWP
+===================================
+
+11.1. API brokered recomendada
+------------------------------
+
+Use QemuHostBrokeredStorageCallbacks version=1. O host mantem os objetos WinRT
+e fornece seus ponteiros ABI opacos, por exemplo com winrt::get_abi():
+
+  StorageFile file = ...;
+  StorageFolder folder = ...;
+  IRandomAccessStream stream = co_await file.OpenAsync(FileAccessMode::Read);
+
+  void *file_abi = winrt::get_abi(file);
+  void *folder_abi = winrt::get_abi(folder);
+  void *stream_abi = winrt::get_abi(stream);
+
+O QEMU nunca chama metodos WinRT nesses ponteiros. O host implementa a vtable e
+traduz cada operacao para StorageFile, StorageFolder e IRandomAccessStream. Isso
+mantem a dependencia de C++/WinRT e do apartment fora da DLL C.
+
+Registre e monte antes de qemu_host_init():
+
+  callbacks.size = sizeof(callbacks);
+  callbacks.version = 1;
+  qemu_host_register_brokered_storage_callbacks(&callbacks, opaque);
+
+  qemu_host_mount_brokered_folder("/brokered/title", folder_abi);
+
+Ou monte um unico arquivo junto do stream ja aberto:
+
+  qemu_host_mount_brokered_file("/brokered/eboot.bin",
+                                file_abi, stream_abi);
+
+Uma pasta montada atende toda a arvore relativa. Um arquivo montado atende
+somente o caminho exato. Montagens sobrepostas usam o prefixo mais especifico.
+O host pode desmontar antes do init com:
+
+  qemu_host_unmount_brokered_storage("/brokered/title");
+
+Registro, montagem e desmontagem retornam -EBUSY depois que a inicializacao
+comecou. Os objetos montados sao retidos pelo callback retain e liberados por
+release no unmount ou qemu_host_cleanup().
+
+Callbacks obrigatorios:
+
+  retain, release, open_file, open_at, read, seek, close e readdir
+
+Callbacks opcionais:
+
+  write, stat_file, stat_at, mkdir_at, unlink_at, rename_at, flush,
+  atomic_replace_at, cleanup_at e truncate
+
+open_file recebe o StorageFile e o IRandomAccessStream do mount de arquivo.
+open_at recebe o StorageFolder e um caminho UTF-8 relativo, sem "..". Retorne
+um handle int64_t proprio; read/write/seek/close/readdir recebem esse handle.
+QEMU_HOST_STORAGE_OPEN_DIRECTORY (0x40000000) em flags solicita um diretorio.
+
+As assinaturas da vtable sao sincronas porque o loader e a HLE usam operacoes
+sincronas. O host deve executar o QEMU fora da thread de UI e implementar a
+ponte para APIs WinRT assincronas sem bloquear o dispatcher da UI. Nao capture
+referencias temporarias: retain/release devem manter cada ponteiro ABI valido
+durante toda a sessao.
+
+Os caminhos virtuais de mount devem:
+
+  - comecar com /;
+  - usar somente / como separador;
+  - nao terminar em /;
+  - nao conter componentes vazios, "." ou "..".
+
+Exemplo de argumentos:
+
+  -kernel /brokered/title/eboot.bin
+
+O loader abre eboot.bin com open_at e enumera /brokered/title/sce_module com
+open_at mais QEMU_HOST_STORAGE_OPEN_DIRECTORY e readdir. As operacoes de SaveData
+e outros arquivos HLE usam a mesma camada quando seus caminhos estao sob um
+mount brokered.
+
+O acesso concedido por picker pode ser persistido pelo aplicativo com
+StorageApplicationPermissions::FutureAccessList. Nao dependa de
+broadFileSystemAccess no Xbox; essa capability nao e suportada nesse ambiente.
+
+Callbacks retornam 0/sucesso, quantidade de bytes ou erro negativo no estilo
+errno, conforme a assinatura. Erros WinRT devem ser convertidos, por exemplo:
+arquivo ausente para -ENOENT, acesso negado para -EACCES, somente leitura para
+-EROFS, argumento invalido para -EINVAL e operacao ausente para -ENOSYS.
+
+11.2. API de paths legada
+-------------------------
+
+Registre QemuHostStorageCallbacks com:
+
+  qemu_host_register_storage_callbacks(&callbacks, opaque)
+
+Preencha sempre:
+
+  callbacks.size = sizeof(callbacks)
+  callbacks.version = 2
+  open, read, write e close
+
+Versoes 1 e 2 sao aceitas. A versao atual pode fornecer tambem seek, stat,
+mkdir, unlink, rename, flush, readdir, atomic_replace, cleanup e truncate.
+
+QEMU_HOST_STORAGE_OPEN_DIRECTORY (0x40000000) identifica abertura de diretorio.
+
+Os caminhos recebidos sao caminhos virtuais do guest, por exemplo:
+
+  /titles/CUSA00000/app0/...
+  /titles/CUSA00000/data/...
+  /titles/CUSA00000/temp/...
+
+O host deve mapear esses caminhos para Package InstalledLocation, LocalFolder,
+TemporaryFolder ou outro StorageFolder autorizado. Normalize cada caminho,
+rejeite ".." e nunca permita escapar do sandbox do titulo.
+
+Callbacks retornam 0/sucesso, quantidade de bytes ou erro negativo no estilo
+errno, conforme a assinatura. Handles sao int64_t opacos definidos pelo host.
+
+
+12. DIALOGS
+===========
+
+  qemu_host_register_dialog_callback(callback, opaque)
+  qemu_host_complete_dialog(request_id, status, payload, payload_size)
+
+O callback recebe request_id, tipo e payload. A UI pode concluir a solicitacao
+assincronamente usando o mesmo request_id. payload_size de resposta e limitado
+a 1 MiB e existem no maximo 16 respostas pendentes. IDs desconhecidos retornam
+-ENOENT; fila cheia retorna -ENOSPC.
+
+
+13. REDE E HTTP
+===============
+
+Rede:
+
+  qemu_host_register_network_callbacks(&callbacks, opaque)
+
+Use version=1 e size=sizeof(callbacks). socket, connect, send, recv e close sao
+obrigatorios. Os callbacks opcionais cobrem bind, listen, accept, shutdown,
+send_to, recv_from, nomes, opcoes, socket_pair e resolve.
+
+Capabilities:
+
+  QEMU_HOST_NETWORK_INTERNET_CLIENT = 1 << 0
+  QEMU_HOST_NETWORK_PRIVATE_CLIENT  = 1 << 1
+
+Declare somente capacidades presentes no manifest UWP e realmente autorizadas.
+
+HTTP:
+
+  qemu_host_register_http_callbacks(&callbacks, opaque)
+
+Use version=1 e size=sizeof(callbacks). Sao obrigatorios create_request, send,
+get_status, get_headers, get_length, read e close. add_header e abort podem ser
+fornecidos. get_headers usa consulta de tamanho quando buffer=NULL.
+
+Nao use APIs de socket/HTTP bloqueantes na thread de UI. Os callbacks chamados
+pelo QEMU devem retornar sem reentrar de forma insegura no ciclo de vida.
+
+
+14. MEDIA, LAUNCH E HLE EXTERNO
+===============================
+
+Media:
+
+  qemu_host_register_media_callbacks(&callbacks, opaque)
+
+Use version=1 e size=sizeof(callbacks). open, control, get_stream_count,
+get_stream_info, read_frame, close e get_time sao obrigatorios. read_frame usa
+consulta de tamanho quando buffer=NULL. Tipos de stream: video=1, audio=2 e
+timed text=3. Controles: start, stop, pause, resume, jump e looping.
+
+Launch:
+
+  qemu_host_register_launch_callback(callback, opaque)
+
+Recebe path, argv e argc quando o guest pede troca/execucao de aplicacao. O host
+decide se permite, rejeita ou inicia outra sessao/processo.
+
+HLE externo:
+
+  qemu_host_register_hle_callback(callback, opaque)
+  qemu_host_hle_callback_enabled()
+
+Registre antes de qemu_host_init. QemuHostHLERequest informa module, library,
+nid, sete argumentos e funcoes read_guest/write_guest. A chamada e sincrona.
+Request, strings, token de memoria e accessors deixam de ser validos quando o
+callback retorna. Retorne o resultado por uint64_t *result somente quando o NID
+for realmente atendido pelo host.
+
+
+15. THREADING E TEMPO DE VIDA
+=============================
+
+Callbacks podem ocorrer na thread interna do QEMU ou na thread que chamou
+main_loop_step. Eles nao sao callbacks de UI. Para atualizar XAML, CoreWindow,
+SwapChainPanel ou controles, poste o trabalho no dispatcher apropriado.
+
+Regras:
+
+  - callbacks devem ser curtos e nao bloquear indefinidamente;
+  - copie buffers temporarios antes de retornar;
+  - mantenha o objeto opaque valido ate desregistrar/cleanup;
+  - nao chame join de dentro de um callback da thread QEMU;
+  - evite chamar init, cleanup ou outro step de dentro de callback;
+  - request_shutdown e apropriado para sinalizar encerramento;
+  - serialize o loop: nunca execute dois main_loop_step simultaneamente;
+  - nao misture qemu_host_start com main_loop_step.
+
+
+16. RETORNOS E ERROS COMUNS
+===========================
+
+As APIs retornam 0 em sucesso, 1 apenas quando main_loop_step informa saida, ou
+erro negativo no estilo errno:
+
+  -EINVAL  parametro, ordem ou estado invalido
+  -EBUSY   operacao concorrente ou ciclo ja iniciado
+  -ENODEV  dispositivo/input nao disponivel
+  -ENOSYS  callback/capacidade opcional nao registrado
+  -ENOENT  handle, request ou recurso inexistente
+  -ENOSPC  limite de fila/recursos atingido
+
+Win32 error 127 significa ERROR_PROC_NOT_FOUND. Se ocorrer em GetProcAddress,
+o aplicativo esta pedindo um nome que nao pertence aos exports desta DLL. Se
+ocorrer em LoadPackagedLibrary, audite os imports da DLL e de todas as suas
+dependencias empacotadas.
+
+
+17. EXPORTS EXISTENTES NA DLL FINAL
+===================================
+
+Ciclo e estado:
+
+  qemu_host_init
+  qemu_host_start
+  qemu_host_main_loop_step
+  qemu_host_request_shutdown
+  qemu_host_reset
+  qemu_host_join
+  qemu_host_cleanup
+  qemu_host_is_initialized
+  qemu_host_is_running
+  qemu_host_get_exit_status
+  qemu_host_get_last_fault
+
+Registro e callbacks:
+
+  qemu_host_register_log_callback
+  qemu_host_log_callback_enabled
+  qemu_host_register_video_callback
+  qemu_host_register_audio_callback
+  qemu_host_register_pad_output_callback
+  qemu_host_register_storage_callbacks
+  qemu_host_register_dialog_callback
+  qemu_host_complete_dialog
+  qemu_host_register_network_callbacks
+  qemu_host_register_http_callbacks
+  qemu_host_register_media_callbacks
+  qemu_host_register_launch_callback
+  qemu_host_register_hle_callback
+  qemu_host_hle_callback_enabled
+
+Input:
+
+  qemu_host_send_key_number
+  qemu_host_send_key_qcode
+  qemu_host_send_pointer_rel
+  qemu_host_send_pointer_abs
+  qemu_host_send_pointer_button
+  qemu_host_capture_pointer_abs
+  qemu_host_pointer_is_absolute
+  qemu_host_send_gamepad_state
+  qemu_host_send_touch_state
+  qemu_host_send_motion_state
+  qemu_host_send_audio_input
+
+Encaminhamento/teste:
+
+  qemu_host_emit_log
+  qemu_host_emit_video_frame
+  qemu_host_emit_audio_frame
+  qemu_host_emit_pad_output
+
+Total atual: 43 exports qemu_host_*.
+
+
+18. EXEMPLO C MINIMO
+====================
+
+  #include <stdbool.h>
+  #include "qemu/qemu-host.h"
+
+  static void video(void *opaque, const void *pixels, int width, int height,
+                    int stride, QemuHostPixelFormat format)
+  {
+      /* Copiar pixels para o recurso grafico do host antes de retornar. */
+  }
+
+  int run_title(const char *eboot)
+  {
+      char machine[] =
+          "shadps4,variant=base,execute=on,title-id=CUSA00000";
+      char audio[] = "none,id=shadps4";
+      char *argv[] = {
+          "qemu-system-shadps4",
+          "-M", machine,
+          "-accel", "tcg,thread=single",
+          "-smp", "8",
+          "-m", "5248M",
+          "-display", "host",
+          "-audiodev", audio,
+          "-nodefaults",
+          "-kernel", (char *)eboot,
+      };
+      int status = 0;
+      int rc;
+
+      qemu_host_register_video_callback(video, NULL);
+      rc = qemu_host_init((int)(sizeof(argv) / sizeof(argv[0])), argv);
+      if (rc < 0) {
+          return rc;
+      }
+      rc = qemu_host_start();
+      if (rc < 0) {
+          return rc;
+      }
+
+      /* Executado posteriormente, quando o aplicativo for encerrar. */
+      qemu_host_request_shutdown();
+      rc = qemu_host_join(&status);
+      if (rc < 0) {
+          return rc;
+      }
+      rc = qemu_host_cleanup();
+      return rc < 0 ? rc : status;
+  }
+
+Em um aplicativo real, nao solicite shutdown imediatamente depois de start.
+Mantenha a sessao ativa e encerre-a em resposta a navegacao, suspensao, comando
+do usuario ou falha do guest.
+
+
+19. CHECKLIST DE INTEGRACAO
+===========================
+
+  [ ] DLL e dependencias presentes no pacote UWP.
+  [ ] LoadPackagedLibrary e todos os GetProcAddress verificados.
+  [ ] Callback de log registrado.
+  [ ] HLE externo registrado antes de init, quando necessario.
+  [ ] Callbacks brokered registrados e mounts criados antes do init.
+  [ ] Storage confinado ao sandbox do title-id.
+  [ ] eboot.bin e sce_module acessiveis pelo mesmo mount brokered.
+  [ ] -M shadps4 com variant, execute e title-id validos.
+  [ ] -accel tcg e -smp 8.
+  [ ] -display host ou none.
+  [ ] -audiodev xaudio2,id=shadps4 ou none,id=shadps4.
+  [ ] Apenas um modo de loop selecionado.
+  [ ] Buffers de video/audio copiados durante os callbacks.
+  [ ] Input enviado somente depois de init.
+  [ ] Shutdown solicitado, thread aguardada e cleanup executado.
+  [ ] DLL de entrega mantida sem pos-processamento por strip.
+  [ ] Imports e caminhos absolutos auditados antes de empacotar.
+
+
+20. INSTRUCOES DE BUILD
+=======================
+
+20.1. Ambiente suportado
+------------------------
+
+Use Windows x86_64 e MSYS2 UCRT64. Nao execute o build no shell MSYS puro nem
+misture pacotes MINGW64, CLANG64 e UCRT64 no mesmo build. O artefato validado foi
+compilado com GCC/MinGW-w64 do ambiente UCRT64.
+
+Ative Developer Mode no Windows. O build do QEMU usa links simbolicos em alguns
+pontos e, sem Developer Mode, pode exigir privilegio administrativo.
+
+Instale tambem um Windows SDK recente para desenvolver e empacotar o aplicativo
+UWP. O configure UWP verifica WindowsApp e os headers Win32/WinRT disponiveis no
+toolchain.
+
+Abra o shell correto pelo atalho "MSYS2 UCRT64" ou pelo PowerShell/cmd:
+
+  C:\msys64\msys2_shell.cmd -defterm -here -no-start -ucrt64
+
+Confirme o ambiente antes de continuar:
+
+  echo $MSYSTEM
+  which cc
+  which python
+  which ninja
+
+Resultado esperado:
+
+  MSYSTEM=UCRT64
+  cc, python e ninja abaixo de /ucrt64/bin
+
+
+20.2. Dependencias MSYS2
+------------------------
+
+Atualize o MSYS2. Se pacman pedir para fechar o terminal, feche, abra novamente
+o shell UCRT64 e repita pacman -Syu ate nao haver atualizacao pendente:
+
+  pacman -Syu
+
+Instale as dependencias do build reduzido:
+
+  pacman -S --needed \
+    base-devel \
+    binutils \
+    bison \
+    diffutils \
+    flex \
+    git \
+    grep \
+    make \
+    sed \
+    mingw-w64-ucrt-x86_64-toolchain \
+    mingw-w64-ucrt-x86_64-glib2 \
+    mingw-w64-ucrt-x86_64-ninja \
+    mingw-w64-ucrt-x86_64-pixman \
+    mingw-w64-ucrt-x86_64-pkgconf \
+    mingw-w64-ucrt-x86_64-python \
+    mingw-w64-ucrt-x86_64-zlib \
+    mingw-w64-ucrt-x86_64-zstd
+
+GTK e SDL nao sao necessarios para esta DLL. O backend visual aceito e host ou
+none, e o configure abaixo desabilita explicitamente GTK e SDL.
+
+Verifique as dependencias principais:
+
+  pkg-config --modversion glib-2.0
+  pkg-config --modversion pixman-1
+  cc --version
+  python --version
+  ninja --version
+
+
+20.3. Obter e preparar o codigo
+-------------------------------
+
+Estas instrucoes pressupoem que o codigo com a maquina shadps4 e a camada de
+embedding ja existe em:
+
+  C:\Users\user1\qemu-11
+
+No shell UCRT64:
+
+  cd /c/Users/user1/qemu-11
+
+Confirme que o target customizado existe:
+
+  test -f configs/targets/x86_64-shadps4-softmmu.mak
+  test -f configs/devices/x86_64-shadps4-softmmu/default.mak
+  test -f include/qemu/qemu-host.h
+  test -f hw/i386/shadps4.c
+
+Nao substitua o target por x86_64-softmmu. O nome correto e:
+
+  x86_64-shadps4-softmmu
+
+
+20.4. Configuracao validada
+---------------------------
+
+Crie um diretorio de build fora da arvore de fontes e execute configure a partir
+dele:
+
+  cd /c/Users/user1/qemu-11
+  mkdir -p build-shadps4-check
+  cd build-shadps4-check
+
+  ../configure \
+    --target-list=x86_64-shadps4-softmmu \
+    --enable-uwp \
+    --disable-debug-info \
+    --disable-werror \
+    --disable-docs \
+    --disable-tools \
+    --disable-gtk \
+    --disable-sdl \
+    --enable-xaudio2
+
+Significado das opcoes:
+
+  --target-list=x86_64-shadps4-softmmu
+      Compila somente o target shadps4. Nao gera maquinas PC genericas.
+
+  --enable-uwp
+      Ativa CONFIG_UWP, seleciona caminhos seguros para UWP e remove backends
+      desktop desabilitados pelo projeto.
+
+  --disable-debug-info
+      Evita informacao DWARF desnecessaria no artefato de distribuicao.
+
+  --disable-werror
+      Impede que warnings de dependencias/toolchain interrompam o build. Warnings
+      novos no codigo shadps4 ainda devem ser investigados.
+
+  --disable-docs
+      Nao exige toolchain de documentacao para gerar a DLL.
+
+  --disable-tools
+      Nao gera qemu-img, qemu-io, qemu-nbd e demais ferramentas independentes.
+
+  --disable-gtk e --disable-sdl
+      Excluem interfaces desktop. Use -display host no aplicativo embutido.
+
+  --enable-xaudio2
+      Compila o backend XAudio2 e, em UWP, resolve a biblioteca de plataforma
+      apropriada pelo WindowsApp durante a configuracao.
+
+O configure deve terminar mostrando pelo menos:
+
+  Target list: x86_64-shadps4-softmmu
+  UWP mode: YES
+  XAudio2 support: YES
+  TCG support: YES
+  GTK support: NO
+  SDL support: NO
+
+Confira tambem os arquivos gerados:
+
+  grep TARGET_DIRS config-host.mak
+  grep CONFIG_UWP config-host.h
+  grep CONFIG_AUDIO_XAUDIO2 config-host.h
+  grep CONFIG_TCG config-host.h
+
+
+20.4.1. Compilar o tradutor SPIR-V para DXIL
+------------------------------------------------
+
+O renderer D3D12 requer a biblioteca Mesa spirv_to_dxil. Ela deve existir
+antes de configurar novamente o QEMU; caso contrario, o backend continua
+disponivel apenas para scanout e nao compila shaders.
+
+Este checkout usa o Mesa que acompanha o shadPS4 e os arquivos nativos em
+build-aux:
+
+  cd /c/Users/user1/qemu-11
+  export PYTHONPATH=/c/Users/user1/qemu-11/.build-python
+  export TMP=C:/Users/user1/qemu-11/build-mesa-dxil-tmp
+  export TEMP=$TMP
+  export TMPDIR=$TMP
+
+  meson setup build-mesa-dxil \
+    C:/Users/user1/Projetos/shadPS4/externals/mesa-kosmickrisp/externals/mesa \
+    --native-file build-aux/mesa-dxil-native.ini \
+    --buildtype release \
+    --default-library static \
+    -Dplatforms=windows \
+    -Dvulkan-drivers=microsoft-experimental \
+    -Dgallium-drivers= \
+    -Dllvm=disabled \
+    -Dspirv-to-dxil=true \
+    -Dspirv-tools=disabled \
+    -Dbuild-tests=false \
+    -Dtools= \
+    -Dzstd=disabled \
+    -Dpkg_config_path=C:/Users/user1/qemu-11/build-aux/pkgconfig
+
+  ninja -j4 -C build-mesa-dxil \
+    src/microsoft/spirv_to_dxil/libspirv_to_dxil.dll
+
+Se o diretorio ja estiver configurado, use meson configure no lugar de meson
+setup. -Dspirv-tools=disabled e obrigatorio para nao introduzir a dependencia
+libSPIRV-Tools.dll no pacote.
+
+Saidas esperadas:
+
+  build-mesa-dxil/src/microsoft/spirv_to_dxil/libspirv_to_dxil.dll
+  build-mesa-dxil/src/microsoft/spirv_to_dxil/libspirv_to_dxil.dll.a
+
+Depois execute meson setup --reconfigure no build do QEMU. O Meson detecta a
+biblioteca, liga as tres funcoes spirv_to_dxil e copia
+libspirv_to_dxil.dll para a raiz do diretorio de build, ao lado da DLL QEMU.
+Na inicializacao, o log correto contem:
+
+  shadPS4 D3D12 backend initialized: ... self-test=ok
+
+
+20.5. Compilar a DLL
+--------------------
+
+A partir da raiz do codigo:
+
+  cd /c/Users/user1/qemu-11
+  ninja -C build-shadps4-check -j1 qemu-system-shadps4.dll
+
+-j1 usa menos memoria e produz um log mais simples. Em uma maquina com memoria
+suficiente pode ser substituido por -j2, -j4 ou outro limite controlado.
+
+Saidas principais:
+
+  build-shadps4-check/qemu-system-shadps4.dll
+  build-shadps4-check/qemu-system-shadps4.dll.a
+  build-shadps4-check/libspirv_to_dxil.dll
+
+A primeira e a DLL embutivel. A segunda e a biblioteca de importacao MinGW.
+A terceira deve ser incluida no mesmo pacote UWP e no mesmo diretorio de carga
+da DLL principal.
+
+Para build incremental, repita apenas:
+
+  ninja -C build-shadps4-check -j1 qemu-system-shadps4.dll
+
+Para limpar objetos sem apagar a configuracao:
+
+  ninja -C build-shadps4-check -t clean
+  ninja -C build-shadps4-check -j1 qemu-system-shadps4.dll
+
+Para uma configuracao completamente nova, prefira outro diretorio vazio:
+
+  mkdir -p build-shadps4-clean
+  cd build-shadps4-clean
+  ../configure \
+    --target-list=x86_64-shadps4-softmmu \
+    --enable-uwp \
+    --disable-debug-info \
+    --disable-werror \
+    --disable-docs \
+    --disable-tools \
+    --disable-gtk \
+    --disable-sdl \
+    --enable-xaudio2
+  ninja -j1 qemu-system-shadps4.dll
+
+
+20.6. Teste focado de storage brokered
+---------------------------------------
+
+Volte para a raiz e execute somente o smoke test da nova ABI:
+
+  cd /c/Users/user1/qemu-11
+
+  python tests/shadps4/test_brokered_storage.py \
+    --dll build-shadps4-check/qemu-system-shadps4.dll
+
+O teste monta uma pasta opaca, fornece eboot.bin por open_at/read/seek, enumera
+sce_module e confirma retain/release no cleanup. Ele nao depende de arquivos de
+jogo externos.
+
+Nao aplique strip na DLL. O artefato de entrega desta configuracao e exatamente
+o PE produzido pelo linker Ninja.
+
+
+20.7. Auditar exports, imports e caminhos
+-----------------------------------------
+
+Exports e imports PE:
+
+  objdump -p build-shadps4-check/qemu-system-shadps4.dll > dll-pe.txt
+  grep 'qemu_host_' dll-pe.txt
+  grep 'DLL Name:' dll-pe.txt
+
+O build validado possui 43 exports qemu_host_*. Entre eles devem aparecer:
+
+  qemu_host_register_brokered_storage_callbacks
+  qemu_host_mount_brokered_file
+  qemu_host_mount_brokered_folder
+  qemu_host_unmount_brokered_storage
+
+Confirme a ausencia dos imports desktop proibidos conhecidos:
+
+  grep -E \
+    'GetConsoleMode|SetConsoleMode|GetLogicalDriveStrings|GetDriveType|\
+SwitchToFiber|CreateFiber|ConvertThreadToFiber|DeleteFiber|CommConfigDialog|\
+ReadConsoleInput|GetDefaultCommConfig|GetDesktopWindow|timeBeginPeriod|\
+timeEndPeriod|timeGetDevCaps|RegOpenKey|RegEnumKey|RegQueryValue|\
+CoInitialize|CoCreateInstance' dll-pe.txt
+
+O comando nao deve produzir saida.
+
+Confirme que caminhos da maquina de build nao foram incorporados:
+
+  strings build-shadps4-check/qemu-system-shadps4.dll | \
+    grep -E 'C:/Users/|C:\\Users\\'
+
+O comando nao deve produzir saida.
+
+Registre tamanho e hash da DLL distribuida:
+
+  ls -l build-shadps4-check/qemu-system-shadps4.dll
+  sha256sum build-shadps4-check/qemu-system-shadps4.dll
+
+
+20.10. Copiar dependencias para o pacote
+----------------------------------------
+
+As DLLs MinGW usadas diretamente podem ser copiadas de /ucrt64/bin para uma
+pasta de staging do pacote. Exemplo, ajuste DESTINO para o projeto UWP:
+
+  DESTINO=/c/caminho/do/projeto-uwp/bin/x64
+  mkdir -p "$DESTINO"
+
+  cp build-shadps4-check/qemu-system-shadps4.dll "$DESTINO"/
+  cp /ucrt64/bin/libgcc_s_seh-1.dll "$DESTINO"/
+  cp /ucrt64/bin/libwinpthread-1.dll "$DESTINO"/
+  cp /ucrt64/bin/libglib-2.0-0.dll "$DESTINO"/
+  cp /ucrt64/bin/libgmodule-2.0-0.dll "$DESTINO"/
+  cp /ucrt64/bin/libpixman-1-0.dll "$DESTINO"/
+  cp /ucrt64/bin/zlib1.dll "$DESTINO"/
+
+Depois audite cada DLL copiada com objdump -p para localizar dependencias
+transitivas. Nao inclua executaveis, arquivos .a, objetos, headers, logs, Meson,
+Ninja ou outros artefatos do diretorio de build no pacote final.
+
+
+20.11. Problemas comuns de build
+--------------------------------
+
+"Cannot create temporary file ... Permission denied":
+
+  mkdir -p /c/Users/user1/qemu-11/.tmp-build
+  export TMPDIR=/c/Users/user1/qemu-11/.tmp-build
+  export TMP=C:/Users/user1/qemu-11/.tmp-build
+  export TEMP=C:/Users/user1/qemu-11/.tmp-build
+
+"ninja: command not found":
+
+  pacman -S --needed mingw-w64-ucrt-x86_64-ninja
+  export PATH=/ucrt64/bin:/usr/bin:$PATH
+
+"XAudio2 support: NO" ou WindowsApp nao encontrado:
+
+  - confirme shell UCRT64;
+  - atualize o toolchain MSYS2;
+  - confirme que xaudio2.h existe em /ucrt64/include;
+  - confira build-shadps4-check/config.log e meson-logs/meson-log.txt.
+
+GTK/SDL aparecem como habilitados:
+
+  - recrie o diretorio de build com --disable-gtk --disable-sdl;
+  - nao reaproveite configuracao antiga de um build desktop.
+
+O build gera qemu-system-x86_64 ou executaveis auxiliares:
+
+  - confirme --target-list=x86_64-shadps4-softmmu;
+  - confirme --disable-tools;
+  - use o alvo Ninja qemu-system-shadps4.dll explicitamente.
+
+O tamanho da DLL mudou depois de um build incremental:
+
+  - alguma compilacao ou relink ocorreu;
+  - repita o teste brokered e as auditorias sobre o novo artefato;
+  - nao aplique strip para tentar restaurar um tamanho anterior.
+
+
+21. COMANDOS DE AUDITORIA DO ARTEFATO
+======================================
+
+Executar em MSYS2 UCRT64 antes de distribuir, sem modificar o PE:
+
+  objdump -p build-shadps4-check/qemu-system-shadps4.dll
+
+  strings build-shadps4-check/qemu-system-shadps4.dll | \
+    grep -E 'C:/Users/|C:\\Users\\'
+
+Teste focado:
+
+  python tests/shadps4/test_brokered_storage.py \
+    --dll build-shadps4-check/qemu-system-shadps4.dll
+
+Resultado esperado:
+
+  processo encerrado com status 0 e imagem brokered carregada

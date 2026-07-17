@@ -1,0 +1,7 @@
+prefix=C:/msys64/ucrt64
+includedir=${prefix}/include
+
+Name: DirectX-Headers
+Description: Windows SDK-compatible DirectX headers for the private Mesa DXIL build
+Version: 1.619.1
+Cflags: -I${includedir}
