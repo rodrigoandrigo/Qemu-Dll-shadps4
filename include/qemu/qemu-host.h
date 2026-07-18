@@ -36,6 +36,11 @@ typedef enum QemuHostLogLevel {
     QEMU_HOST_LOG_DEBUG = 3,
 } QemuHostLogLevel;
 
+#define QEMU_HOST_API_VERSION_MAJOR 1U
+#define QEMU_HOST_API_VERSION_MINOR 1U
+#define QEMU_HOST_API_VERSION \
+    ((QEMU_HOST_API_VERSION_MAJOR << 16) | QEMU_HOST_API_VERSION_MINOR)
+
 typedef enum QemuHostPixelFormat {
     QEMU_HOST_PIXEL_FORMAT_UNKNOWN = 0,
     QEMU_HOST_PIXEL_FORMAT_BGRA8888 = 1,
@@ -481,6 +486,38 @@ typedef void (*QemuHostVideoCallback)(void *opaque,
                                       int height,
                                       int stride,
                                       QemuHostPixelFormat format);
+
+#define QEMU_HOST_D3D12_VIDEO_FRAME_VERSION 1
+
+/*
+ * D3D12 objects are borrowed and remain owned by QEMU. The callback is
+ * synchronous. A same-process host should enqueue its copy/present work on
+ * command_queue before returning, leaving resource in resource_state. A host
+ * using another device/queue must open the shared handles, wait for
+ * fence_value, and finish reading the resource before the callback returns.
+ */
+typedef struct QemuHostD3D12VideoFrame {
+    uint32_t size;
+    uint32_t version;
+    uint64_t frame_id;
+    uint32_t buffer_index;
+    uint32_t width;
+    uint32_t height;
+    uint32_t dxgi_format;
+    uint32_t resource_state;
+    uint32_t adapter_luid_low;
+    int32_t adapter_luid_high;
+    uint64_t resource_handle;
+    uint64_t fence_handle;
+    uint64_t fence_value;
+    void *device;
+    void *command_queue;
+    void *resource;
+    void *fence;
+} QemuHostD3D12VideoFrame;
+
+typedef void (*QemuHostD3D12VideoCallback)(
+    void *opaque, const QemuHostD3D12VideoFrame *frame);
 typedef void (*QemuHostAudioCallback)(void *opaque,
                                       const void *samples,
                                       size_t size,
@@ -491,6 +528,7 @@ typedef void (*QemuHostPadOutputCallback)(void *opaque, int controller,
                                          const QemuHostPadOutput *output);
 
 QEMU_HOST_EXPORT int qemu_host_init(int argc, char **argv);
+QEMU_HOST_EXPORT uint32_t qemu_host_get_api_version(void);
 QEMU_HOST_EXPORT int qemu_host_start(void);
 QEMU_HOST_EXPORT int qemu_host_main_loop_step(bool nonblocking,
                                               int *exit_status);
@@ -517,6 +555,11 @@ QEMU_HOST_EXPORT void qemu_host_emit_video_frame(const void *pixels,
                                                  int height,
                                                  int stride,
                                                  QemuHostPixelFormat format);
+QEMU_HOST_EXPORT int qemu_host_register_d3d12_video_callback(
+    QemuHostD3D12VideoCallback cb, void *opaque);
+QEMU_HOST_EXPORT bool qemu_host_d3d12_video_callback_enabled(void);
+QEMU_HOST_EXPORT void qemu_host_emit_d3d12_video_frame(
+    const QemuHostD3D12VideoFrame *frame);
 
 QEMU_HOST_EXPORT void qemu_host_register_audio_callback(
     QemuHostAudioCallback cb, void *opaque);

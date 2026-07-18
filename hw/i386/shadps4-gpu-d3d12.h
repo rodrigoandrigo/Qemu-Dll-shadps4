@@ -32,5 +32,7 @@ bool shadps4_d3d12_register_surface(ShadPS4D3D12State *d3d12,
 bool shadps4_d3d12_read_surface(ShadPS4D3D12State *d3d12,
                                 uint32_t index, uint8_t *pixels,
                                 uint32_t stride);
+bool shadps4_d3d12_publish_surface(ShadPS4D3D12State *d3d12,
+                                   uint32_t index, uint64_t frame_id);
 
 #endif /* HW_I386_SHADPS4_GPU_D3D12_H */

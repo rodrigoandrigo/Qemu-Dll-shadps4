@@ -70,6 +70,11 @@ bool shadps4_io_configure_audio(ShadPS4IOState *io, int rate, int channels,
                                 QemuHostAudioFormat format);
 bool shadps4_io_emit_audio(ShadPS4IOState *io, CPUState *cs,
                            uint64_t guest_addr, size_t size);
+bool shadps4_io_emit_audio_format(ShadPS4IOState *io, CPUState *cs,
+                                  uint64_t guest_addr, size_t size,
+                                  int rate, int channels,
+                                  QemuHostAudioFormat format,
+                                  bool local_playback);
 bool shadps4_io_drain_audio(ShadPS4IOState *io);
 bool shadps4_io_set_audio_volume(ShadPS4IOState *io, bool muted,
                                  int channels, const uint8_t *volume);

@@ -15,6 +15,7 @@
 #include "exec/cputlb.h"
 #define QEMU_HOST_INTERNAL
 #include "hw/i386/shadps4-hle.h"
+#include "system/cpus.h"
 #include "system/runstate.h"
 #include "target/i386/cpu.h"
 
@@ -943,8 +944,8 @@ static bool shadps4_hle_storage_path(ShadPS4HLEState *hle, const char *path,
     }
     *read_only = !save_data && g_str_has_prefix(path, "/app0/");
     if ((save_data &&
-         g_snprintf(scoped, scoped_size, "/titles/%s/savedata/%s%s",
-                    hle->title_id, hle->save_data_dir, save_suffix) >=
+         g_snprintf(scoped, scoped_size, "%s/%s%s",
+                    hle->save_data_root, hle->save_data_dir, save_suffix) >=
                     scoped_size) ||
         (!save_data &&
          g_snprintf(scoped, scoped_size, "/titles/%s%s",
@@ -3240,8 +3241,9 @@ static uint64_t shadps4_hle_audio_out_open(ShadPS4HLEState *hle,
         !frames || frames > 8192 || sample_rate != 48000 ||
         !shadps4_hle_audio_format(format, &channels, &sample_size,
                                   &host_format) ||
-        !shadps4_io_configure_audio(hle->io, sample_rate, channels,
-                                    host_format)) {
+        ((port_type != 2 && port_type != 3 && port_type != 4) &&
+         !shadps4_io_configure_audio(hle->io, sample_rate, channels,
+                                     host_format))) {
         return -SHADPS4_GUEST_EINVAL;
     }
     for (i = 0; i < SHADPS4_HLE_MAX_AUDIO_PORTS; i++) {
@@ -3280,7 +3282,11 @@ static uint64_t shadps4_hle_audio_out_output(ShadPS4HLEState *hle,
                -SHADPS4_GUEST_EAGAIN;
     }
     size = (size_t)port->frames * port->channels * port->sample_size;
-    if (!shadps4_io_emit_audio(hle->io, cs, data_addr, size)) {
+    if (!shadps4_io_emit_audio_format(
+            hle->io, cs, data_addr, size, 48000, port->channels,
+            port->format,
+            port->port_type != 2 && port->port_type != 3 &&
+            port->port_type != 4)) {
         return -SHADPS4_GUEST_EFAULT;
     }
     port->last_output_time = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000;
@@ -3295,7 +3301,8 @@ static uint64_t shadps4_hle_audio_in_open(ShadPS4HLEState *hle,
     uint32_t channels = format == 0 ? 1 : format == 2 ? 2 : 0;
     uint32_t i;
 
-    if (!channels || !frames || frames > 8192 || sample_rate != 48000) {
+    if (!channels || !frames || frames > 2048 ||
+        (sample_rate != 16000 && sample_rate != 48000)) {
         return -SHADPS4_GUEST_EINVAL;
     }
     for (i = 0; i < SHADPS4_HLE_MAX_AUDIO_PORTS; i++) {
@@ -3557,6 +3564,195 @@ static uint64_t shadps4_hle_gnm_compat_command(CPUState *cs,
     return shadps4_guest_rw(cs, command_addr, commands,
                             command_dwords * sizeof(*commands), true) ?
            0 : -SHADPS4_GUEST_EFAULT;
+}
+
+static uint64_t shadps4_hle_gnm_compat_init_command(CPUState *cs,
+                                                    uint64_t command_addr,
+                                                    uint64_t capacity_dwords)
+{
+    const uint32_t used_dwords = 0x100;
+
+    if (!command_addr || capacity_dwords < used_dwords) {
+        return 0;
+    }
+    if (shadps4_hle_gnm_compat_command(cs, command_addr, used_dwords)) {
+        return 0;
+    }
+    return used_dwords;
+}
+
+static bool shadps4_hle_gnm_pm4_set(uint32_t *commands, uint32_t capacity,
+                                   uint32_t *offset, uint32_t opcode,
+                                   uint32_t reg, const uint32_t *values,
+                                   uint32_t value_count)
+{
+    if (value_count > capacity - *offset - 2) {
+        return false;
+    }
+    commands[(*offset)++] = UINT32_C(0xc0000000) |
+                            (value_count << 16) | (opcode << 8);
+    commands[(*offset)++] = reg;
+    memcpy(commands + *offset, values, value_count * sizeof(*values));
+    *offset += value_count;
+    return true;
+}
+
+static bool shadps4_hle_gnm_pm4_trailing_nop(uint32_t *commands,
+                                             uint32_t capacity,
+                                             uint32_t offset)
+{
+    uint32_t remaining = capacity - offset;
+
+    if (remaining < 2) {
+        return false;
+    }
+    commands[offset] = UINT32_C(0xc0001000) | ((remaining - 2) << 16);
+    return true;
+}
+
+static uint64_t shadps4_hle_gnm_write_shader_command(
+    CPUState *cs, uint64_t command_addr, uint32_t command_dwords,
+    uint64_t registers_addr, bool pixel, uint32_t shader_modifier)
+{
+    uint32_t registers[12] = { 0 };
+    uint32_t commands[40] = { 0 };
+    uint32_t values[2];
+    uint32_t register_count = pixel ? 12 : 7;
+    uint32_t expected_dwords = pixel ? 40 : 29;
+    uint32_t offset = 0;
+
+    if (!command_addr || !registers_addr ||
+        command_dwords != expected_dwords ||
+        !shadps4_guest_rw(cs, registers_addr, registers,
+                          register_count * sizeof(*registers), false)) {
+        return UINT64_MAX;
+    }
+    for (uint32_t i = 0; i < register_count; i++) {
+        registers[i] = le32_to_cpu(registers[i]);
+    }
+    if (registers[1] || (!pixel && (shader_modifier & 0xfcfffc3f))) {
+        return UINT64_MAX;
+    }
+    if (pixel) {
+        values[0] = registers[0]; values[1] = 0;
+        shadps4_hle_gnm_pm4_set(commands, expected_dwords, &offset,
+                                0x76, 8, values, 2);
+        values[0] = registers[2]; values[1] = registers[3];
+        shadps4_hle_gnm_pm4_set(commands, expected_dwords, &offset,
+                                0x76, 10, values, 2);
+        shadps4_hle_gnm_pm4_set(commands, expected_dwords, &offset,
+                                0x69, 0x1c4, &registers[4], 2);
+        shadps4_hle_gnm_pm4_set(commands, expected_dwords, &offset,
+                                0x69, 0x1b3, &registers[6], 2);
+        shadps4_hle_gnm_pm4_set(commands, expected_dwords, &offset,
+                                0x69, 0x1b6, &registers[8], 1);
+        shadps4_hle_gnm_pm4_set(commands, expected_dwords, &offset,
+                                0x69, 0x1b8, &registers[9], 1);
+        shadps4_hle_gnm_pm4_set(commands, expected_dwords, &offset,
+                                0x69, 0x203, &registers[10], 1);
+        shadps4_hle_gnm_pm4_set(commands, expected_dwords, &offset,
+                                0x69, 0x8f, &registers[11], 1);
+    } else {
+        values[0] = registers[0]; values[1] = 0;
+        shadps4_hle_gnm_pm4_set(commands, expected_dwords, &offset,
+                                0x76, 0x48, values, 2);
+        values[0] = shader_modifier ?
+            (registers[2] & 0xfcfffc3f) | shader_modifier : registers[2];
+        values[1] = registers[3];
+        shadps4_hle_gnm_pm4_set(commands, expected_dwords, &offset,
+                                0x76, 0x4a, values, 2);
+        shadps4_hle_gnm_pm4_set(commands, expected_dwords, &offset,
+                                0x69, 0x207, &registers[6], 1);
+        shadps4_hle_gnm_pm4_set(commands, expected_dwords, &offset,
+                                0x69, 0x1b1, &registers[4], 1);
+        shadps4_hle_gnm_pm4_set(commands, expected_dwords, &offset,
+                                0x69, 0x1c3, &registers[5], 1);
+    }
+    if (!shadps4_hle_gnm_pm4_trailing_nop(
+            commands, expected_dwords, offset)) {
+        return UINT64_MAX;
+    }
+    for (uint32_t i = 0; i < expected_dwords; i++) {
+        commands[i] = cpu_to_le32(commands[i]);
+    }
+    return shadps4_guest_rw(cs, command_addr, commands,
+                            expected_dwords * sizeof(*commands), true) ?
+           0 : -SHADPS4_GUEST_EFAULT;
+}
+
+static uint64_t shadps4_hle_gnm_draw_index(CPUState *cs,
+                                           uint64_t command_addr,
+                                           uint64_t command_dwords,
+                                           uint64_t index_count,
+                                           uint64_t index_addr,
+                                           uint64_t flags)
+{
+    uint32_t commands[10] = { 0 };
+
+    if (!command_addr || command_dwords != ARRAY_SIZE(commands) ||
+        !index_addr || (index_addr & 1) || (flags & 0x1ffffffe) ||
+        index_count > UINT32_MAX) {
+        return UINT64_MAX;
+    }
+    commands[0] = UINT32_C(0xc0042700);
+    commands[1] = index_count;
+    commands[2] = index_addr;
+    commands[3] = index_addr >> 32;
+    commands[4] = index_count;
+    commands[5] = flags & UINT32_C(0xe0000000);
+    commands[6] = UINT32_C(0xc0021000);
+    for (uint32_t i = 0; i < ARRAY_SIZE(commands); i++) {
+        commands[i] = cpu_to_le32(commands[i]);
+    }
+    return shadps4_guest_rw(cs, command_addr, commands, sizeof(commands),
+                            true) ? 0 : -SHADPS4_GUEST_EFAULT;
+}
+
+static uint64_t shadps4_hle_gnm_compat_dispatch_command(
+    ShadPS4HLEState *hle, CPUState *cs, uint64_t a0, uint64_t a1,
+    uint64_t a2, uint64_t a3, uint64_t a4)
+{
+    if (!strcmp(hle->last_hle_nid, "bQVd5YzCal0") ||
+        !strcmp(hle->last_hle_nid, "5uFKckiJYRM") ||
+        !strcmp(hle->last_hle_nid, "4MgRw-bVNQU") ||
+        !strcmp(hle->last_hle_nid, "mLVL7N7BVBg")) {
+        return shadps4_hle_gnm_write_shader_command(
+            cs, a0, a1, a2, true, 0);
+    }
+    if (!strcmp(hle->last_hle_nid, "gAhCn6UiU4Y") ||
+        !strcmp(hle->last_hle_nid, "V31V01UiScY")) {
+        return shadps4_hle_gnm_write_shader_command(
+            cs, a0, a1, a2, false, a3);
+    }
+    if (!strcmp(hle->last_hle_nid, "HlTPoZ-oY7Y")) {
+        return shadps4_hle_gnm_draw_index(cs, a0, a1, a2, a3, a4);
+    }
+    return shadps4_hle_gnm_compat_command(cs, a0, a1);
+}
+
+static void shadps4_hle_gnm_report_compat(ShadPS4HLEState *hle,
+                                          uint64_t command_addr,
+                                          uint64_t command_dwords)
+{
+    uint32_t i;
+
+    for (i = 0; i < hle->gnm_compat_seen_count; i++) {
+        if (!strcmp(hle->gnm_compat_seen[i], hle->last_hle_nid)) {
+            return;
+        }
+    }
+    if (i < ARRAY_SIZE(hle->gnm_compat_seen)) {
+        pstrcpy(hle->gnm_compat_seen[i], sizeof(hle->gnm_compat_seen[i]),
+                hle->last_hle_nid);
+        hle->gnm_compat_seen_count++;
+    }
+    info_report("shadPS4 GNM compat builder: NID='%s' command=%#" PRIx64
+                " capacity_dwords=%" PRIu64 " args=[%#" PRIx64 ",%#" PRIx64
+                ",%#" PRIx64 ",%#" PRIx64 ",%#" PRIx64 "]",
+                hle->last_hle_nid, command_addr, command_dwords,
+                hle->last_hle_args[0], hle->last_hle_args[1],
+                hle->last_hle_args[2], hle->last_hle_args[3],
+                hle->last_hle_args[4]);
 }
 
 static uint64_t shadps4_hle_net_transfer(ShadPS4HLEState *hle, CPUState *cs,
@@ -4885,24 +5081,17 @@ static uint64_t shadps4_hle_save_mount(ShadPS4HLEState *hle, CPUState *cs,
         !strcmp(directory, ".") || !strcmp(directory, "..")) {
         return -SHADPS4_GUEST_EINVAL;
     }
-    ret = g_snprintf(scoped, sizeof(scoped), "/titles/%s", hle->title_id);
-    if (ret < 0 || (size_t)ret >= sizeof(scoped)) {
+    if (!hle->save_data_root[0]) {
         return -SHADPS4_GUEST_EINVAL;
     }
-    ret = qemu_host_storage_mkdir(scoped, 0777);
+
+    ret = qemu_host_storage_mkdir(hle->save_data_root, 0777);
     if (ret < 0 && ret != -EEXIST) {
         return -SHADPS4_GUEST_EIO;
     }
-    ret = g_snprintf(scoped, sizeof(scoped), "/titles/%s/savedata",
-                     hle->title_id);
-    ret = ret >= sizeof(scoped) ? -SHADPS4_GUEST_EINVAL :
-          qemu_host_storage_mkdir(scoped, 0777);
-    if (ret < 0 && ret != -EEXIST) {
-        return -SHADPS4_GUEST_EIO;
-    }
-    ret = g_snprintf(scoped, sizeof(scoped), "/titles/%s/savedata/%s",
-                     hle->title_id, directory);
-    if (ret >= sizeof(scoped)) {
+    ret = g_snprintf(scoped, sizeof(scoped), "%s/%s",
+                     hle->save_data_root, directory);
+    if (ret < 0 || (size_t)ret >= sizeof(scoped)) {
         return -SHADPS4_GUEST_EINVAL;
     }
     ret = qemu_host_storage_mkdir(scoped, 0777);
@@ -4935,8 +5124,8 @@ static uint64_t shadps4_hle_save_delete(ShadPS4HLEState *hle, CPUState *cs,
         !directory[0] || strchr(directory, '/') || strchr(directory, '\\')) {
         return -SHADPS4_GUEST_EINVAL;
     }
-    if (g_snprintf(scoped, sizeof(scoped), "/titles/%s/savedata/%s",
-                   hle->title_id, directory) >= sizeof(scoped)) {
+    if (g_snprintf(scoped, sizeof(scoped), "%s/%s",
+                   hle->save_data_root, directory) >= sizeof(scoped)) {
         return -SHADPS4_GUEST_EINVAL;
     }
     return qemu_host_storage_cleanup(scoped);
@@ -4946,9 +5135,8 @@ static bool shadps4_hle_save_memory_path(ShadPS4HLEState *hle,
                                          uint32_t slot, char *path,
                                          size_t path_size)
 {
-    int length = g_snprintf(path, path_size,
-                            "/titles/%s/savedata/memory%u.bin",
-                            hle->title_id, slot);
+    int length = g_snprintf(path, path_size, "%s/memory%u.bin",
+                            hle->save_data_root, slot);
 
     return length >= 0 && (size_t)length < path_size;
 }
@@ -4961,7 +5149,6 @@ static uint64_t shadps4_hle_save_memory_setup(ShadPS4HLEState *hle,
     ShadPS4GuestSaveMemorySetup setup;
     QemuHostStorageStat stat;
     char path[192];
-    char directory[160];
     uint64_t memory_size;
     uint64_t existed_size = 0;
     uint64_t existed_size_le;
@@ -4981,14 +5168,7 @@ static uint64_t shadps4_hle_save_memory_setup(ShadPS4HLEState *hle,
         !shadps4_hle_save_memory_path(hle, slot, path, sizeof(path))) {
         return -SHADPS4_GUEST_EINVAL;
     }
-    g_snprintf(directory, sizeof(directory), "/titles/%s", hle->title_id);
-    ret = qemu_host_storage_mkdir(directory, 0777);
-    if (ret < 0 && ret != -EEXIST) {
-        return -SHADPS4_GUEST_EIO;
-    }
-    g_snprintf(directory, sizeof(directory), "/titles/%s/savedata",
-               hle->title_id);
-    ret = qemu_host_storage_mkdir(directory, 0777);
+    ret = qemu_host_storage_mkdir(hle->save_data_root, 0777);
     if (ret < 0 && ret != -EEXIST) {
         return -SHADPS4_GUEST_EIO;
     }
@@ -5178,7 +5358,6 @@ static uint64_t shadps4_hle_save_memory_setup_legacy(ShadPS4HLEState *hle,
                                                      uint64_t memory_size)
 {
     QemuHostStorageStat stat;
-    char directory[160];
     char path[192];
     int64_t handle;
     uint8_t zero = 0;
@@ -5189,14 +5368,7 @@ static uint64_t shadps4_hle_save_memory_setup_legacy(ShadPS4HLEState *hle,
         !shadps4_hle_save_memory_path(hle, 0, path, sizeof(path))) {
         return -SHADPS4_GUEST_EINVAL;
     }
-    g_snprintf(directory, sizeof(directory), "/titles/%s", hle->title_id);
-    ret = qemu_host_storage_mkdir(directory, 0777);
-    if (ret < 0 && ret != -EEXIST) {
-        return shadps4_hle_host_result(ret);
-    }
-    g_snprintf(directory, sizeof(directory), "/titles/%s/savedata",
-               hle->title_id);
-    ret = qemu_host_storage_mkdir(directory, 0777);
+    ret = qemu_host_storage_mkdir(hle->save_data_root, 0777);
     if (ret < 0 && ret != -EEXIST) {
         return shadps4_hle_host_result(ret);
     }
@@ -5258,8 +5430,8 @@ static uint64_t shadps4_hle_save_icon(ShadPS4HLEState *hle, CPUState *cs,
     icon[1] = le64_to_cpu(icon[1]);
     icon[2] = le64_to_cpu(icon[2]);
     if (!icon[0] || icon[1] > 4 * MiB ||
-        g_snprintf(path, sizeof(path), "/titles/%s/savedata/%s/icon0.png",
-                   hle->title_id, hle->save_data_dir) >= sizeof(path)) {
+        g_snprintf(path, sizeof(path), "%s/%s/icon0.png",
+                   hle->save_data_root, hle->save_data_dir) >= sizeof(path)) {
         return -SHADPS4_GUEST_EINVAL;
     }
     if (write) {
@@ -5372,9 +5544,34 @@ void shadps4_hle_init(ShadPS4HLEState *hle, AddressSpace *as,
     hle->gpu = gpu;
     hle->io = io;
     pstrcpy(hle->title_id, sizeof(hle->title_id), title_id);
+    g_snprintf(hle->save_data_root, sizeof(hle->save_data_root),
+               "/titles/%s/savedata", hle->title_id);
+    if (qemu_host_storage_path_is_brokered("/savedata")) {
+        g_snprintf(hle->save_data_root, sizeof(hle->save_data_root),
+                   "/savedata/%s", hle->title_id);
+    } else if (qemu_host_storage_path_is_brokered("/title") &&
+               !qemu_host_storage_path_is_brokered(hle->save_data_root)) {
+        g_snprintf(hle->save_data_root, sizeof(hle->save_data_root),
+                   "/savedata/%s", hle->title_id);
+        warn_report("shadPS4 SaveData: no writable brokered mount; mount "
+                    "ApplicationData LocalFolder at '/savedata' before "
+                    "qemu_host_init");
+    }
+    info_report("shadPS4 SaveData root: virtual='%s' brokered=%u",
+                hle->save_data_root,
+                qemu_host_storage_path_is_brokered(hle->save_data_root));
     hle->dynamic_pd_phys = dynamic_pd_phys;
     hle->dynamic_virt_base = dynamic_virt_base;
     hle->cleanup_done = true;
+}
+
+void shadps4_hle_set_thread_callbacks(ShadPS4HLEState *hle, void *opaque,
+                                      ShadPS4HLEThreadStart start,
+                                      ShadPS4HLEThreadExit exit)
+{
+    hle->thread_opaque = opaque;
+    hle->thread_start = start;
+    hle->thread_exit = exit;
 }
 
 void shadps4_hle_set_modules(ShadPS4HLEState *hle,
@@ -5463,6 +5660,10 @@ bool shadps4_hle_reset(ShadPS4HLEState *hle, uint64_t dynamic_phys_base,
     hle->last_hle_library[0] = '\0';
     hle->last_hle_module[0] = '\0';
     hle->last_hle_return_address = 0;
+    hle->hle_trace_call_count = 0;
+    memset(hle->cpu_thread_handles, 0, sizeof(hle->cpu_thread_handles));
+    hle->cpu_thread_handles[0] = 1;
+    memset(hle->cpu_wait_mutex, 0, sizeof(hle->cpu_wait_mutex));
     hle->hle_history_head = 0;
     hle->hle_history_count = 0;
     memset(hle->hle_history, 0, sizeof(hle->hle_history));
@@ -5930,6 +6131,57 @@ static void shadps4_hle_report_fault(ShadPS4HLEState *hle, CPUState *cs)
     }
 }
 
+static uint64_t shadps4_hle_current_thread(const ShadPS4HLEState *hle,
+                                           const CPUState *cs)
+{
+    return cs->cpu_index < ARRAY_SIZE(hle->cpu_thread_handles) &&
+           hle->cpu_thread_handles[cs->cpu_index] ?
+           hle->cpu_thread_handles[cs->cpu_index] : 1;
+}
+
+static void shadps4_hle_park_cpu(CPUState *cs)
+{
+    cpu_interrupt(cs, CPU_INTERRUPT_HALT);
+}
+
+static void shadps4_hle_wake_cpu(uint32_t cpu_index)
+{
+    CPUState *target;
+
+    CPU_FOREACH(target) {
+        if (target->cpu_index == cpu_index) {
+            target->halted = 0;
+            cpu_reset_interrupt(target, CPU_INTERRUPT_HALT);
+            qemu_cpu_kick(target);
+            return;
+        }
+    }
+}
+
+static bool shadps4_hle_mutex_wake_waiter(ShadPS4HLEState *hle,
+                                          uint64_t mutex)
+{
+    uint64_t slot = mutex - 0x400;
+    uint64_t waiters = hle->service_aux_value[slot];
+    uint32_t cpu_index;
+
+    if (!waiters) {
+        hle->service_active[slot] = false;
+        hle->service_user_data[slot] = 0;
+        hle->service_value[slot] = 0;
+        return false;
+    }
+    cpu_index = ctz64(waiters);
+    hle->service_aux_value[slot] &= ~BIT_ULL(cpu_index);
+    hle->service_active[slot] = true;
+    hle->service_user_data[slot] =
+        hle->cpu_thread_handles[cpu_index] ?: 1;
+    hle->service_value[slot] = 1;
+    hle->cpu_wait_mutex[cpu_index] = 0;
+    shadps4_hle_wake_cpu(cpu_index);
+    return true;
+}
+
 uint64_t shadps4_hle_dispatch(ShadPS4HLEState *hle, CPUState *cs,
                               uint64_t number)
 {
@@ -5957,6 +6209,17 @@ uint64_t shadps4_hle_dispatch(ShadPS4HLEState *hle, CPUState *cs,
     hle_args[6] = a6;
     if (number != SHADPS4_HLE_INTERNAL_FAULT) {
         shadps4_hle_record_call(hle, cs, env, number, hle_args);
+        hle->hle_trace_call_count++;
+        if (g_getenv("SHADPS4_HLE_TRACE") &&
+            !(hle->hle_trace_call_count & (hle->hle_trace_call_count - 1))) {
+            info_report("shadPS4 HLE trace: calls=%" PRIu64
+                        " number=%#" PRIx64 " NID='%s' library='%s'"
+                        " args=[%#" PRIx64 ",%#" PRIx64 ",%#" PRIx64
+                        ",%#" PRIx64 ",%#" PRIx64 "]",
+                        hle->hle_trace_call_count, number,
+                        hle->last_hle_nid, hle->last_hle_library,
+                        a0, a1, a2, a3, a4);
+        }
     }
 
     if (number >= SHADPS4_HLE_EXTERNAL_BASE &&
@@ -6659,11 +6922,12 @@ uint64_t shadps4_hle_dispatch(ShadPS4HLEState *hle, CPUState *cs,
         return shadps4_gpu_ding_dong(hle->gpu, cs, a0, a1) ?
                0 : -SHADPS4_GUEST_EINVAL;
     case SHADPS4_HLE_GNM_COMPAT_COMMAND:
-        return shadps4_hle_gnm_compat_command(cs, a0, a1);
+        shadps4_hle_gnm_report_compat(hle, a0, a1);
+        return shadps4_hle_gnm_compat_dispatch_command(
+            hle, cs, a0, a1, a2, a3, a4);
     case SHADPS4_HLE_GNM_COMPAT_INIT_COMMAND: {
-        uint64_t result = shadps4_hle_gnm_compat_command(cs, a0, a1);
-
-        return result ? result : a1;
+        shadps4_hle_gnm_report_compat(hle, a0, a1);
+        return shadps4_hle_gnm_compat_init_command(cs, a0, a1);
     }
     case SHADPS4_HLE_GNM_WORKLOAD_CREATE: {
         uint32_t stream = cpu_to_le32(1);
@@ -7472,8 +7736,8 @@ uint64_t shadps4_hle_dispatch(ShadPS4HLEState *hle, CPUState *cs,
                                       sizeof(directory))) {
             return SHADPS4_SAVE_ERROR_PARAMETER;
         }
-        g_snprintf(path, sizeof(path), "/titles/%s/savedata/%s",
-                   hle->title_id, directory);
+        g_snprintf(path, sizeof(path), "%s/%s",
+                   hle->save_data_root, directory);
         if (qemu_host_storage_stat(path, &stat) < 0) {
             return SHADPS4_SAVE_ERROR_NOT_FOUND;
         }
@@ -8994,6 +9258,7 @@ uint64_t shadps4_hle_dispatch(ShadPS4HLEState *hle, CPUState *cs,
     case SHADPS4_HLE_MUTEX_TIMEDLOCK:
     case SHADPS4_HLE_MUTEX_TRYLOCK: {
         uint64_t handle = 0;
+        uint64_t owner = shadps4_hle_current_thread(hle, cs);
         uint64_t result;
         bool object_handle_result;
         ShadPS4GuestTime timeout;
@@ -9021,12 +9286,22 @@ uint64_t shadps4_hle_dispatch(ShadPS4HLEState *hle, CPUState *cs,
                     le64_to_cpu(timeout.fraction) >= NANOSECONDS_PER_SECOND)) {
             result = SHADPS4_GUEST_EINVAL;
         } else if (hle->service_active[handle - 0x400] &&
-                   hle->service_user_data[handle - 0x400] != 1) {
-            result = number == SHADPS4_HLE_MUTEX_TRYLOCK ?
-                     SHADPS4_GUEST_EBUSY : SHADPS4_GUEST_EAGAIN;
+                   hle->service_user_data[handle - 0x400] != owner) {
+            if (number == SHADPS4_HLE_MUTEX_TRYLOCK ||
+                number == SHADPS4_HLE_MUTEX_TIMEDLOCK) {
+                result = SHADPS4_GUEST_EBUSY;
+            } else if (cs->cpu_index >= 64) {
+                result = SHADPS4_GUEST_EAGAIN;
+            } else {
+                hle->service_aux_value[handle - 0x400] |=
+                    BIT_ULL(cs->cpu_index);
+                hle->cpu_wait_mutex[cs->cpu_index] = handle;
+                shadps4_hle_park_cpu(cs);
+                result = 0;
+            }
         } else {
             hle->service_active[handle - 0x400] = true;
-            hle->service_user_data[handle - 0x400] = 1;
+            hle->service_user_data[handle - 0x400] = owner;
             hle->service_value[handle - 0x400]++;
             result = 0;
         }
@@ -9043,16 +9318,17 @@ uint64_t shadps4_hle_dispatch(ShadPS4HLEState *hle, CPUState *cs,
     }
     case SHADPS4_HLE_MUTEX_UNLOCK: {
         uint64_t handle;
+        uint64_t owner = shadps4_hle_current_thread(hle, cs);
 
         if (!shadps4_hle_object_handle(
                 hle, cs, a0, SHADPS4_SERVICE_MUTEX, &handle) ||
             !hle->service_active[handle - 0x400] ||
-            !hle->service_value[handle - 0x400]) {
+            !hle->service_value[handle - 0x400] ||
+            hle->service_user_data[handle - 0x400] != owner) {
             return SHADPS4_GUEST_EINVAL;
         }
         if (!--hle->service_value[handle - 0x400]) {
-            hle->service_active[handle - 0x400] = false;
-            hle->service_user_data[handle - 0x400] = 0;
+            shadps4_hle_mutex_wake_waiter(hle, handle);
         }
         return 0;
     }
@@ -9095,21 +9371,59 @@ uint64_t shadps4_hle_dispatch(ShadPS4HLEState *hle, CPUState *cs,
     case SHADPS4_HLE_COND_WAIT: {
         uint64_t cond;
         uint64_t mutex;
+        uint64_t owner = shadps4_hle_current_thread(hle, cs);
 
         if (!shadps4_hle_object_handle(
                 hle, cs, a0, SHADPS4_SERVICE_COND, &cond) ||
             !shadps4_hle_object_handle(
-                hle, cs, a1, SHADPS4_SERVICE_MUTEX, &mutex)) {
+                hle, cs, a1, SHADPS4_SERVICE_MUTEX, &mutex) ||
+            !hle->service_active[mutex - 0x400] ||
+            hle->service_user_data[mutex - 0x400] != owner ||
+            cs->cpu_index >= 64) {
             return SHADPS4_GUEST_EINVAL;
         }
-        return SHADPS4_KERNEL_ERROR_ETIMEDOUT;
+        hle->service_aux_value[cond - 0x400] |= BIT_ULL(cs->cpu_index);
+        hle->cpu_wait_mutex[cs->cpu_index] = mutex;
+        if (!--hle->service_value[mutex - 0x400]) {
+            shadps4_hle_mutex_wake_waiter(hle, mutex);
+        }
+        shadps4_hle_park_cpu(cs);
+        return 0;
     }
     case SHADPS4_HLE_COND_SIGNAL: {
         uint64_t handle;
+        uint64_t waiters;
 
-        return shadps4_hle_object_handle(
-                   hle, cs, a0, SHADPS4_SERVICE_COND, &handle) ?
-               0 : SHADPS4_GUEST_EINVAL;
+        if (!shadps4_hle_object_handle(
+                hle, cs, a0, SHADPS4_SERVICE_COND, &handle)) {
+            return SHADPS4_GUEST_EINVAL;
+        }
+        waiters = hle->service_aux_value[handle - 0x400];
+        hle->service_aux_value[handle - 0x400] = 0;
+        while (waiters) {
+            uint32_t cpu_index = ctz64(waiters);
+            uint64_t mutex = hle->cpu_wait_mutex[cpu_index];
+
+            waiters &= ~BIT_ULL(cpu_index);
+            if (shadps4_hle_service_is(
+                    hle, mutex, SHADPS4_SERVICE_MUTEX) &&
+                hle->service_active[mutex - 0x400]) {
+                hle->service_aux_value[mutex - 0x400] |=
+                    BIT_ULL(cpu_index);
+            } else if (shadps4_hle_service_is(
+                           hle, mutex, SHADPS4_SERVICE_MUTEX)) {
+                hle->service_active[mutex - 0x400] = true;
+                hle->service_user_data[mutex - 0x400] =
+                    hle->cpu_thread_handles[cpu_index] ?: 1;
+                hle->service_value[mutex - 0x400] = 1;
+                hle->cpu_wait_mutex[cpu_index] = 0;
+                shadps4_hle_wake_cpu(cpu_index);
+            } else {
+                hle->cpu_wait_mutex[cpu_index] = 0;
+                shadps4_hle_wake_cpu(cpu_index);
+            }
+        }
+        return 0;
     }
     case SHADPS4_HLE_RWLOCK_ATTR_INIT:
         return shadps4_hle_object_create(
@@ -9857,19 +10171,93 @@ uint64_t shadps4_hle_dispatch(ShadPS4HLEState *hle, CPUState *cs,
         return 0;
     }
     case SHADPS4_HLE_PTHREAD_SELF:
-        return 1;
+        return cs->cpu_index < ARRAY_SIZE(hle->cpu_thread_handles) &&
+               hle->cpu_thread_handles[cs->cpu_index] ?
+               hle->cpu_thread_handles[cs->cpu_index] : 1;
     case SHADPS4_HLE_PTHREAD_CREATE: {
         uint64_t result = shadps4_hle_object_create(
             hle, cs, a0, SHADPS4_SERVICE_THREAD, 0);
         uint64_t handle;
+        uint64_t stack_addr = 0;
+        uint64_t stack_size = 512 * KiB;
+        uint64_t stack_pointer;
+        uint64_t gs_base = X86_CPU(cs)->env.segs[R_GS].base;
+        uint64_t return_address = 0;
 
         if (result || !shadps4_hle_object_handle(
                 hle, cs, a0, SHADPS4_SERVICE_THREAD, &handle)) {
             return result ?: SHADPS4_GUEST_EFAULT;
         }
+        if (!a2 || !hle->thread_start) {
+            shadps4_hle_service_delete(
+                hle, handle, SHADPS4_SERVICE_THREAD);
+            return SHADPS4_GUEST_EINVAL;
+        }
+        if (a1) {
+            uint64_t attr_handle;
+
+            if (!shadps4_hle_object_handle(
+                    hle, cs, a1, SHADPS4_SERVICE_PTHREAD_ATTR,
+                    &attr_handle)) {
+                shadps4_hle_service_delete(
+                    hle, handle, SHADPS4_SERVICE_THREAD);
+                return SHADPS4_GUEST_EINVAL;
+            }
+            stack_addr = hle->pthread_attrs[attr_handle - 0x400].stack_addr;
+            stack_size = hle->pthread_attrs[attr_handle - 0x400].stack_size ?:
+                         stack_size;
+        }
+        if (!stack_addr) {
+            stack_addr = shadps4_hle_mmap(hle, cs, 0, stack_size, 3);
+            if ((int64_t)stack_addr < 0) {
+                shadps4_hle_service_delete(
+                    hle, handle, SHADPS4_SERVICE_THREAD);
+                return SHADPS4_GUEST_ENOMEM;
+            }
+        }
+        for (uint32_t i = 0; hle->hle_image &&
+             i < hle->hle_image->symbol_count; i++) {
+            const ShadPS4DynamicSymbol *symbol = &hle->hle_image->symbols[i];
+
+            if (symbol->type == SHADPS4_ELF_STT_FUNC &&
+                (!strcmp(symbol->nid ?: "", "3kg7rT0NQIs") ||
+                 !strcmp(symbol->nid ?: "", "FJrT5LuUBAU"))) {
+                return_address = hle->hle_image->virtual_base + symbol->value;
+                break;
+            }
+        }
+        stack_pointer = (stack_addr + stack_size) & ~UINT64_C(15);
+        if (!return_address || stack_pointer < stack_addr + 16) {
+            shadps4_hle_service_delete(
+                hle, handle, SHADPS4_SERVICE_THREAD);
+            return SHADPS4_GUEST_EFAULT;
+        }
+        stack_pointer -= 16;
+        return_address = cpu_to_le64(return_address);
+        if (!shadps4_guest_rw(cs, stack_pointer, &return_address,
+                              sizeof(return_address), true) ||
+            !shadps4_guest_rw(cs, stack_pointer + 8, &return_address,
+                              sizeof(return_address), true)) {
+            shadps4_hle_service_delete(
+                hle, handle, SHADPS4_SERVICE_THREAD);
+            return SHADPS4_GUEST_EFAULT;
+        }
         hle->service_user_data[handle - 0x400] = a2;
         hle->service_value[handle - 0x400] = a3;
-        hle->service_active[handle - 0x400] = false;
+        hle->service_active[handle - 0x400] = true;
+        result = hle->thread_start(hle->thread_opaque, handle, a2, a3,
+                                   stack_pointer, gs_base);
+        if (result) {
+            shadps4_hle_service_delete(
+                hle, handle, SHADPS4_SERVICE_THREAD);
+            return result == -EAGAIN ? SHADPS4_GUEST_EAGAIN :
+                                      SHADPS4_GUEST_EINVAL;
+        }
+        if (g_getenv("SHADPS4_HLE_TRACE")) {
+            info_report("shadPS4 pthread_create: handle=%#" PRIx64
+                        " entry=%#" PRIx64 " arg=%#" PRIx64
+                        " attr=%#" PRIx64, handle, a2, a3, a1);
+        }
         return 0;
     }
     case SHADPS4_HLE_PTHREAD_DETACH:
@@ -9889,6 +10277,10 @@ uint64_t shadps4_hle_dispatch(ShadPS4HLEState *hle, CPUState *cs,
             hle->service_nonblock[a0 - 0x400]) {
             return SHADPS4_GUEST_EINVAL;
         }
+        if (hle->service_active[a0 - 0x400]) {
+            return SHADPS4_GUEST_EBUSY;
+        }
+        result = cpu_to_le64(hle->service_aux_value[a0 - 0x400]);
         if (a1 && !shadps4_guest_rw(cs, a1, &result,
                                     sizeof(result), true)) {
             return SHADPS4_GUEST_EFAULT;
@@ -9921,9 +10313,27 @@ uint64_t shadps4_hle_dispatch(ShadPS4HLEState *hle, CPUState *cs,
                0 : SHADPS4_GUEST_EFAULT;
     }
     case SHADPS4_HLE_PTHREAD_GET_TID:
-        return 1;
-    case SHADPS4_HLE_PTHREAD_EXIT:
+        return cs->cpu_index < ARRAY_SIZE(hle->cpu_thread_handles) &&
+               hle->cpu_thread_handles[cs->cpu_index] ?
+               hle->cpu_thread_handles[cs->cpu_index] : 1;
+    case SHADPS4_HLE_PTHREAD_EXIT: {
+        uint64_t handle = cs->cpu_index <
+            ARRAY_SIZE(hle->cpu_thread_handles) ?
+            hle->cpu_thread_handles[cs->cpu_index] : 0;
+
+        if (handle > 0x400 &&
+            shadps4_hle_service_is(hle, handle, SHADPS4_SERVICE_THREAD)) {
+            hle->service_active[handle - 0x400] = false;
+            hle->service_aux_value[handle - 0x400] = a0;
+        }
+        if (cs->cpu_index < ARRAY_SIZE(hle->cpu_thread_handles)) {
+            hle->cpu_thread_handles[cs->cpu_index] = 0;
+        }
+        if (hle->thread_exit) {
+            hle->thread_exit(hle->thread_opaque, cs, handle, a0);
+        }
         return 0;
+    }
     case SHADPS4_HLE_PTHREAD_GET_PRIORITY:
         return shadps4_hle_write_u32(cs, a1, 700);
     case SHADPS4_HLE_PTHREAD_GET_SCHEDPARAM:

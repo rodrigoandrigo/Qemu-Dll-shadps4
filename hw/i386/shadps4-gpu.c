@@ -16,6 +16,8 @@
 
 #define SHADPS4_VBLANK_PERIOD_NS 16666667
 #define SHADPS4_GPU_MAX_COMMAND_DWORDS 0xfffff
+#define SHADPS4_GPU_MAX_FLATTENED_DWORDS \
+    (SHADPS4_GPU_MAX_COMMAND_DWORDS * SHADPS4_PM4_MAX_IB_DEPTH)
 #define SHADPS4_GPU_MAX_FRAME_SIZE (64 * MiB)
 
 #define SHADPS4_PM4_TYPE0 0
@@ -32,6 +34,59 @@
 #define SHADPS4_PM4_SET_SH_REG 0x76
 #define SHADPS4_PM4_MAX_IB_DEPTH 8
 #define SHADPS4_PM4_MAX_DMA_SIZE (2 * MiB)
+
+typedef struct ShadPS4GPUParseError {
+    uint32_t offset;
+    uint32_t header;
+    const char *reason;
+} ShadPS4GPUParseError;
+
+static bool shadps4_gpu_is_tail_padding(const uint32_t *commands,
+                                        uint32_t offset,
+                                        uint32_t command_dwords)
+{
+    for (uint32_t i = offset; i < command_dwords; i++) {
+        uint32_t word = le32_to_cpu(commands[i]);
+
+        if (word != 0 && word != UINT32_C(0x80000000)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool shadps4_gpu_parse_fail(ShadPS4GPUParseError *error,
+                                   uint32_t offset, uint32_t header,
+                                   const char *reason)
+{
+    if (error) {
+        error->offset = offset;
+        error->header = header;
+        error->reason = reason;
+    }
+    return false;
+}
+
+static void shadps4_gpu_report_reject(ShadPS4GPUState *gpu,
+                                      const char *phase,
+                                      uint64_t guest_address,
+                                      uint32_t command_dwords,
+                                      const ShadPS4GPUParseError *error)
+{
+    gpu->rejected_submit_count++;
+    if (gpu->rejected_submit_count & (gpu->rejected_submit_count - 1)) {
+        return;
+    }
+    warn_report("shadPS4 GPU submission rejected: count=%" PRIu64
+                " phase=%s guest=%#" PRIx64 " dwords=%u"
+                " offset=%u header=%#x type=%u opcode=%#x reason=%s",
+                gpu->rejected_submit_count, phase, guest_address,
+                command_dwords, error ? error->offset : 0,
+                error ? error->header : 0,
+                error ? error->header >> 30 : 0,
+                error ? (error->header >> 8) & 0xff : 0,
+                error && error->reason ? error->reason : "unspecified");
+}
 
 static bool shadps4_gpu_guest_rw(CPUState *cs, uint64_t addr, void *data,
                                  size_t size, bool write)
@@ -81,15 +136,96 @@ static bool shadps4_gpu_copy_guest(CPUState *cs, uint64_t destination,
            shadps4_gpu_guest_rw(cs, destination, buffer, size, true);
 }
 
-static bool shadps4_gpu_execute_pm4_memory(CPUState *cs,
-                                           const uint32_t *commands,
-                                           uint32_t command_dwords,
-                                           uint32_t depth)
+static bool shadps4_gpu_flatten_pm4(CPUState *cs,
+                                    const uint32_t *commands,
+                                    uint32_t command_dwords,
+                                    uint32_t depth, GArray *flattened,
+                                    ShadPS4GPUParseError *error)
 {
     uint32_t offset = 0;
 
     if (depth > SHADPS4_PM4_MAX_IB_DEPTH) {
-        return false;
+        return shadps4_gpu_parse_fail(error, 0, 0,
+                                      "indirect-buffer-depth");
+    }
+    while (offset < command_dwords) {
+        uint32_t header = le32_to_cpu(commands[offset]);
+        uint32_t type = header >> 30;
+        uint32_t payload_count;
+        uint32_t packet_dwords;
+
+        if ((header == 0 || header == UINT32_C(0x80000000)) &&
+            shadps4_gpu_is_tail_padding(commands, offset, command_dwords)) {
+            return true;
+        }
+        if (type == SHADPS4_PM4_TYPE2) {
+            payload_count = 0;
+        } else if (type == SHADPS4_PM4_TYPE0 ||
+                   type == SHADPS4_PM4_TYPE1) {
+            payload_count = type == SHADPS4_PM4_TYPE0 ?
+                            ((header >> 16) & 0x3fff) + 1 : 2;
+        } else {
+            payload_count = ((header >> 16) & 0x3fff) + 1;
+        }
+        if (payload_count > command_dwords - offset - 1) {
+            return shadps4_gpu_parse_fail(error, offset, header,
+                                          "truncated-packet-during-flatten");
+        }
+        packet_dwords = payload_count + 1;
+        if (type == SHADPS4_PM4_TYPE3 &&
+            (((header >> 8) & 0xff) == SHADPS4_PM4_INDIRECT_BUFFER_CONST ||
+             ((header >> 8) & 0xff) == SHADPS4_PM4_INDIRECT_BUFFER)) {
+            g_autofree uint32_t *indirect = NULL;
+            const uint32_t *payload = commands + offset + 1;
+            uint64_t address;
+            uint32_t words;
+
+            if (payload_count < 3) {
+                return shadps4_gpu_parse_fail(error, offset, header,
+                                              "truncated-indirect-buffer");
+            }
+            address = le32_to_cpu(payload[0]) |
+                      (uint64_t)(le32_to_cpu(payload[1]) & 0xffff) << 32;
+            words = le32_to_cpu(payload[2]) & 0xfffff;
+            if (!address || !words ||
+                words > SHADPS4_GPU_MAX_COMMAND_DWORDS) {
+                return shadps4_gpu_parse_fail(error, offset, header,
+                                              "indirect-buffer-range");
+            }
+            indirect = g_new(uint32_t, words);
+            if (!shadps4_gpu_guest_rw(cs, address, indirect,
+                                      words * sizeof(*indirect), false)) {
+                return shadps4_gpu_parse_fail(error, offset, header,
+                                              "indirect-buffer-memory");
+            }
+            if (!shadps4_gpu_flatten_pm4(cs, indirect, words, depth + 1,
+                                         flattened, error)) {
+                return false;
+            }
+        } else {
+            if (packet_dwords > SHADPS4_GPU_MAX_FLATTENED_DWORDS -
+                                flattened->len) {
+                return shadps4_gpu_parse_fail(error, offset, header,
+                                              "flattened-buffer-too-large");
+            }
+            g_array_append_vals(flattened, commands + offset, packet_dwords);
+        }
+        offset += packet_dwords;
+    }
+    return true;
+}
+
+static bool shadps4_gpu_execute_pm4_memory(CPUState *cs,
+                                           const uint32_t *commands,
+                                           uint32_t command_dwords,
+                                           uint32_t depth,
+                                           ShadPS4GPUParseError *error)
+{
+    uint32_t offset = 0;
+
+    if (depth > SHADPS4_PM4_MAX_IB_DEPTH) {
+        return shadps4_gpu_parse_fail(error, 0, 0,
+                                      "indirect-buffer-depth");
     }
     while (offset < command_dwords) {
         uint32_t header = le32_to_cpu(commands[offset]);
@@ -97,6 +233,11 @@ static bool shadps4_gpu_execute_pm4_memory(CPUState *cs,
         uint32_t payload_count;
         uint32_t opcode;
         const uint32_t *payload;
+
+        if ((header == 0 || header == UINT32_C(0x80000000)) &&
+            shadps4_gpu_is_tail_padding(commands, offset, command_dwords)) {
+            return true;
+        }
 
         if (type == SHADPS4_PM4_TYPE2) {
             offset++;
@@ -106,7 +247,8 @@ static bool shadps4_gpu_execute_pm4_memory(CPUState *cs,
             payload_count = type == SHADPS4_PM4_TYPE0 ?
                             ((header >> 16) & 0x3fff) + 1 : 2;
             if (payload_count > command_dwords - offset - 1) {
-                return false;
+                return shadps4_gpu_parse_fail(error, offset, header,
+                                              "truncated-type0-or-type1");
             }
             offset += payload_count + 1;
             continue;
@@ -114,7 +256,8 @@ static bool shadps4_gpu_execute_pm4_memory(CPUState *cs,
         opcode = (header >> 8) & 0xff;
         payload_count = ((header >> 16) & 0x3fff) + 1;
         if (payload_count > command_dwords - offset - 1) {
-            return false;
+            return shadps4_gpu_parse_fail(error, offset, header,
+                                          "truncated-type3");
         }
         payload = commands + offset + 1;
         switch (opcode) {
@@ -128,7 +271,8 @@ static bool shadps4_gpu_execute_pm4_memory(CPUState *cs,
                 uint32_t words = payload_count - 3;
 
                 if ((dst_sel != 2 && dst_sel != 5) || !address) {
-                    return false;
+                    return shadps4_gpu_parse_fail(error, offset, header,
+                                                  "write-data-destination");
                 }
                 for (uint32_t i = 0; i < words; i++) {
                     uint32_t value = payload[3 + i];
@@ -137,7 +281,8 @@ static bool shadps4_gpu_execute_pm4_memory(CPUState *cs,
 
                     if (!shadps4_gpu_guest_rw(cs, write_address, &value,
                                               sizeof(value), true)) {
-                        return false;
+                        return shadps4_gpu_parse_fail(error, offset, header,
+                                                      "write-data-memory");
                     }
                 }
             }
@@ -155,7 +300,8 @@ static bool shadps4_gpu_execute_pm4_memory(CPUState *cs,
 
                 if ((dst_sel != 0 && dst_sel != 3) ||
                     size > SHADPS4_PM4_MAX_DMA_SIZE) {
-                    return false;
+                    return shadps4_gpu_parse_fail(error, offset, header,
+                                                  "dma-destination-or-size");
                 }
                 if (src_sel == 2) {
                     uint32_t value = payload[1];
@@ -166,16 +312,20 @@ static bool shadps4_gpu_execute_pm4_memory(CPUState *cs,
                                              size - done);
                         if (!shadps4_gpu_guest_rw(cs, destination + done,
                                                   &value, chunk, true)) {
-                            return false;
+                            return shadps4_gpu_parse_fail(error, offset,
+                                                          header,
+                                                          "dma-fill-memory");
                         }
                         done += chunk;
                     }
                 } else if ((src_sel == 0 || src_sel == 3) &&
                            !shadps4_gpu_copy_guest(cs, destination,
                                                    source, size)) {
-                    return false;
+                    return shadps4_gpu_parse_fail(error, offset, header,
+                                                  "dma-copy-memory");
                 } else if (src_sel != 0 && src_sel != 3) {
-                    return false;
+                    return shadps4_gpu_parse_fail(error, offset, header,
+                                                  "dma-source");
                 }
             }
             break;
@@ -197,11 +347,13 @@ static bool shadps4_gpu_execute_pm4_memory(CPUState *cs,
                     value = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
                     size = sizeof(uint64_t);
                 } else if (data_sel != 0) {
-                    return false;
+                    return shadps4_gpu_parse_fail(error, offset, header,
+                                                  "eop-data-select");
                 }
                 if (size && !shadps4_gpu_guest_rw(cs, address, &value,
                                                   size, true)) {
-                    return false;
+                    return shadps4_gpu_parse_fail(error, offset, header,
+                                                  "eop-memory");
                 }
             }
             break;
@@ -216,13 +368,18 @@ static bool shadps4_gpu_execute_pm4_memory(CPUState *cs,
 
                 if (!address || !words ||
                     words > SHADPS4_GPU_MAX_COMMAND_DWORDS) {
-                    return false;
+                    return shadps4_gpu_parse_fail(error, offset, header,
+                                                  "indirect-buffer-range");
                 }
                 indirect = g_new(uint32_t, words);
                 if (!shadps4_gpu_guest_rw(cs, address, indirect,
                                           words * sizeof(*indirect), false) ||
                     !shadps4_gpu_execute_pm4_memory(cs, indirect, words,
-                                                    depth + 1)) {
+                                                    depth + 1, error)) {
+                    if (error && !error->reason) {
+                        shadps4_gpu_parse_fail(error, offset, header,
+                                               "indirect-buffer-memory");
+                    }
                     return false;
                 }
             }
@@ -240,7 +397,8 @@ static bool shadps4_gpu_parse_pm4(const ShadPS4GPUState *gpu,
                                   uint32_t command_dwords,
                                   uint32_t *context_registers,
                                   uint32_t *shader_registers,
-                                  uint64_t *parsed_packet_count)
+                                  uint64_t *parsed_packet_count,
+                                  ShadPS4GPUParseError *error)
 {
     uint32_t offset = 0;
 
@@ -257,6 +415,11 @@ static bool shadps4_gpu_parse_pm4(const ShadPS4GPUState *gpu,
         const uint32_t *payload;
         bool valid = true;
 
+        if ((header == 0 || header == UINT32_C(0x80000000)) &&
+            shadps4_gpu_is_tail_padding(commands, offset, command_dwords)) {
+            return true;
+        }
+
         if (type == SHADPS4_PM4_TYPE2) {
             (*parsed_packet_count)++;
             offset++;
@@ -266,7 +429,8 @@ static bool shadps4_gpu_parse_pm4(const ShadPS4GPUState *gpu,
             payload_count = type == SHADPS4_PM4_TYPE0 ?
                             ((header >> 16) & 0x3fff) + 1 : 2;
             if (payload_count > command_dwords - offset - 1) {
-                return false;
+                return shadps4_gpu_parse_fail(error, offset, header,
+                                              "truncated-type0-or-type1");
             }
             /* Preserve packet framing for legacy type 0/1 register writes.
              * The D3D12 translator consumes the type 3 state used by GNM. */
@@ -277,7 +441,8 @@ static bool shadps4_gpu_parse_pm4(const ShadPS4GPUState *gpu,
         opcode = (header >> 8) & 0xff;
         payload_count = ((header >> 16) & 0x3fff) + 1;
         if (payload_count > command_dwords - offset - 1) {
-            return false;
+            return shadps4_gpu_parse_fail(error, offset, header,
+                                          "truncated-type3");
         }
         payload = &commands[offset + 1];
         switch (opcode) {
@@ -302,7 +467,8 @@ static bool shadps4_gpu_parse_pm4(const ShadPS4GPUState *gpu,
             break;
         }
         if (!valid) {
-            return false;
+            return shadps4_gpu_parse_fail(error, offset, header,
+                                          "invalid-register-packet");
         }
         (*parsed_packet_count)++;
         offset += payload_count + 1;
@@ -341,6 +507,8 @@ void shadps4_gpu_reset(ShadPS4GPUState *gpu)
     gpu->parsed_packet_count = 0;
     gpu->rejected_submit_count = 0;
     gpu->last_fence_value = 0;
+    gpu->video_backend_valid = false;
+    gpu->last_video_d3d12 = false;
     memset(gpu->context_registers, 0, sizeof(gpu->context_registers));
     memset(gpu->shader_registers, 0, sizeof(gpu->shader_registers));
     memset(gpu->queues, 0, sizeof(gpu->queues));
@@ -379,7 +547,8 @@ void shadps4_gpu_finish(ShadPS4GPUState *gpu)
     /* PM4 processing is synchronous in this backend.  Keep this boundary so
     * an asynchronous renderer can wait for its queue before scanout. */
 #ifdef CONFIG_WIN32
-    if (gpu->d3d12 && !shadps4_d3d12_finish(gpu->d3d12)) {
+    if (gpu->d3d12 && shadps4_d3d12_is_ready(gpu->d3d12) &&
+        !shadps4_d3d12_finish(gpu->d3d12)) {
         warn_report("shadPS4 D3D12: failed to finish GPU queue");
     }
 #else
@@ -465,32 +634,49 @@ static bool shadps4_gpu_submit_commands(ShadPS4GPUState *gpu, CPUState *cs,
                                         const uint32_t *commands,
                                         uint32_t command_dwords,
                                         uint32_t queue_id,
+                                        uint64_t guest_address,
                                         uint64_t fence_addr,
                                         uint64_t fence_value)
 {
+    g_autoptr(GArray) flattened = g_array_sized_new(
+        false, false, sizeof(uint32_t), MIN(command_dwords, 4096));
     uint32_t context_registers[ARRAY_SIZE(gpu->context_registers)];
     uint32_t shader_registers[ARRAY_SIZE(gpu->shader_registers)];
     uint64_t parsed_packet_count = 0;
     uint64_t fence;
     bool parsed;
+    ShadPS4GPUParseError error = { 0 };
 
     if (!commands || !command_dwords ||
         command_dwords > SHADPS4_GPU_MAX_COMMAND_DWORDS ||
         queue_id >= SHADPS4_GPU_MAX_QUEUES) {
-        gpu->rejected_submit_count++;
+        shadps4_gpu_report_reject(gpu, "arguments", guest_address,
+                                  command_dwords,
+                                  NULL);
         return false;
     }
-    parsed = shadps4_gpu_parse_pm4(gpu, commands, command_dwords,
+    if (!shadps4_gpu_flatten_pm4(cs, commands, command_dwords, 0,
+                                 flattened, &error)) {
+        shadps4_gpu_report_reject(gpu, "flatten", guest_address,
+                                  command_dwords, &error);
+        return false;
+    }
+    parsed = shadps4_gpu_parse_pm4(gpu,
+                                   (const uint32_t *)flattened->data,
+                                   flattened->len,
                                    context_registers, shader_registers,
-                                   &parsed_packet_count);
+                                   &parsed_packet_count, &error);
     if (!parsed) {
-        gpu->rejected_submit_count++;
+        shadps4_gpu_report_reject(gpu, "parse", guest_address,
+                                  command_dwords, &error);
         return false;
     }
 #ifdef CONFIG_WIN32
-    if (gpu->d3d12 &&
-        !shadps4_d3d12_submit(gpu->d3d12, cs, commands,
-                              command_dwords, queue_id,
+    if (gpu->d3d12 && shadps4_d3d12_is_ready(gpu->d3d12) &&
+        flattened->len &&
+        !shadps4_d3d12_submit(gpu->d3d12, cs,
+                              (const uint32_t *)flattened->data,
+                              flattened->len, queue_id,
                               gpu->context_registers,
                               ARRAY_SIZE(gpu->context_registers),
                               gpu->shader_registers,
@@ -498,20 +684,27 @@ static bool shadps4_gpu_submit_commands(ShadPS4GPUState *gpu, CPUState *cs,
         warn_report("shadPS4 D3D12: command submission failed; using CPU "
                     "scanout fallback");
     }
-    if (gpu->d3d12 && !shadps4_d3d12_finish(gpu->d3d12)) {
-        gpu->rejected_submit_count++;
+    if (gpu->d3d12 && shadps4_d3d12_is_ready(gpu->d3d12) &&
+        !shadps4_d3d12_finish(gpu->d3d12)) {
+        shadps4_gpu_report_reject(gpu, "d3d12-finish", guest_address,
+                                  command_dwords, NULL);
         return false;
     }
 #endif
-    if (!shadps4_gpu_execute_pm4_memory(cs, commands, command_dwords, 0)) {
-        gpu->rejected_submit_count++;
+    memset(&error, 0, sizeof(error));
+    if (!shadps4_gpu_execute_pm4_memory(
+            cs, (const uint32_t *)flattened->data, flattened->len, 0,
+            &error)) {
+        shadps4_gpu_report_reject(gpu, "memory", guest_address,
+                                  command_dwords, &error);
         return false;
     }
     if (fence_addr) {
         fence = cpu_to_le64(fence_value);
         if (!shadps4_gpu_guest_rw(cs, fence_addr, &fence,
                                   sizeof(fence), true)) {
-            gpu->rejected_submit_count++;
+            shadps4_gpu_report_reject(gpu, "fence", fence_addr,
+                                      command_dwords, NULL);
             return false;
         }
     }
@@ -539,19 +732,23 @@ bool shadps4_gpu_submit(ShadPS4GPUState *gpu, CPUState *cs,
     if (!submit->command_dwords ||
         submit->command_dwords > SHADPS4_GPU_MAX_COMMAND_DWORDS ||
         submit->queue_id >= SHADPS4_GPU_MAX_QUEUES) {
-        gpu->rejected_submit_count++;
+        shadps4_gpu_report_reject(gpu, "submit-arguments",
+                                  submit->command_addr,
+                                  submit->command_dwords, NULL);
         return false;
     }
     commands = g_new(uint32_t, submit->command_dwords);
     if (!shadps4_gpu_guest_rw(cs, submit->command_addr, commands,
                               submit->command_dwords * sizeof(uint32_t),
                               false)) {
-        gpu->rejected_submit_count++;
+        shadps4_gpu_report_reject(gpu, "guest-read", submit->command_addr,
+                                  submit->command_dwords, NULL);
         return false;
     }
     return shadps4_gpu_submit_commands(gpu, cs, commands,
                                        submit->command_dwords,
-                                       submit->queue_id, submit->fence_addr,
+                                       submit->queue_id, submit->command_addr,
+                                       submit->fence_addr,
                                        submit->fence_value);
 }
 
@@ -626,7 +823,9 @@ bool shadps4_gpu_ding_dong(ShadPS4GPUState *gpu, CPUState *cs,
             return false;
         }
         if (!shadps4_gpu_submit_commands(gpu, cs, commands, command_dwords,
-                                         queue_id - 1, 0, 0)) {
+                                         queue_id - 1,
+                                         queue->ring_addr +
+                                         queue->read_offset * 4, 0, 0)) {
             return false;
         }
         queue->read_offset = next_offset;
@@ -693,6 +892,24 @@ bool shadps4_gpu_flip(ShadPS4GPUState *gpu, CPUState *cs,
         gpu->frame_capacity = frame_size;
     }
 #ifdef CONFIG_WIN32
+    if (gpu->d3d12 && qemu_host_d3d12_video_callback_enabled() &&
+        shadps4_d3d12_publish_surface(gpu->d3d12, flip->buffer_index,
+                                      gpu->flip_count + 1)) {
+        gpu->flip_count++;
+        if (gpu->flip_count <= 3 || !(gpu->flip_count % 60) ||
+            !gpu->video_backend_valid || !gpu->last_video_d3d12) {
+            message = g_strdup_printf(
+                "host video: flip=%" PRIu64 " buffer=%u gpu=%#" PRIx64
+                " size=%ux%u format=%u backend=d3d12-shared",
+                gpu->flip_count, flip->buffer_index, flip->pixels_addr,
+                flip->width, flip->height,
+                QEMU_HOST_PIXEL_FORMAT_BGRA8888);
+            qemu_host_emit_log(QEMU_HOST_LOG_INFO, message);
+        }
+        gpu->video_backend_valid = true;
+        gpu->last_video_d3d12 = true;
+        return true;
+    }
     if (gpu->d3d12 &&
         shadps4_d3d12_read_surface(gpu->d3d12, flip->buffer_index,
                                    gpu->frame, output_stride)) {
@@ -723,22 +940,28 @@ frame_ready:
 #endif
     gpu->flip_count++;
     pixel_count = (size_t)flip->width * flip->height;
-    for (size_t i = 0; i < pixel_count; i++) {
-        uint32_t pixel;
+    if (gpu->flip_count <= 3 || !(gpu->flip_count % 60) ||
+        !gpu->video_backend_valid ||
+        gpu->last_video_d3d12 != d3d12_frame) {
+        for (size_t i = 0; i < pixel_count; i++) {
+            uint32_t pixel;
 
-        memcpy(&pixel, gpu->frame + i * 4, sizeof(pixel));
-        nonblack += (pixel & 0x00ffffff) != 0;
+            memcpy(&pixel, gpu->frame + i * 4, sizeof(pixel));
+            nonblack += (pixel & 0x00ffffff) != 0;
+        }
+        memcpy(&sample, gpu->frame, sizeof(sample));
+        message = g_strdup_printf(
+            "host video: flip=%" PRIu64 " buffer=%u gpu=%#" PRIx64
+            " cpu=%p size=%ux%u pitch=%u format=%u sample=%08x"
+            " nonblack=%zu/%zu tiling=%u backend=%s",
+            gpu->flip_count, flip->buffer_index, flip->pixels_addr,
+            gpu->frame, flip->width, flip->height, output_stride,
+            QEMU_HOST_PIXEL_FORMAT_BGRA8888, sample, nonblack, pixel_count,
+            flip->tiling_mode, d3d12_frame ? "d3d12" : "guest-memory");
+        qemu_host_emit_log(QEMU_HOST_LOG_INFO, message);
     }
-    memcpy(&sample, gpu->frame, sizeof(sample));
-    message = g_strdup_printf(
-        "host video: flip=%" PRIu64 " buffer=%u gpu=%#" PRIx64
-        " cpu=%p size=%ux%u pitch=%u format=%u sample=%08x"
-        " nonblack=%zu/%zu tiling=%u backend=%s",
-        gpu->flip_count, flip->buffer_index, flip->pixels_addr, gpu->frame,
-        flip->width, flip->height, output_stride,
-        QEMU_HOST_PIXEL_FORMAT_BGRA8888, sample, nonblack, pixel_count,
-        flip->tiling_mode, d3d12_frame ? "d3d12" : "guest-memory");
-    qemu_host_emit_log(QEMU_HOST_LOG_INFO, message);
+    gpu->video_backend_valid = true;
+    gpu->last_video_d3d12 = d3d12_frame;
     qemu_host_emit_video_frame(gpu->frame, flip->width, flip->height,
                                output_stride,
                                QEMU_HOST_PIXEL_FORMAT_BGRA8888);

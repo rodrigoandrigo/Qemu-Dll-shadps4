@@ -174,8 +174,10 @@ Opcoes gerais aceitas neste build:
       eboot, todos os modulos, HLE, TLS, stacks e buffers.
 
   -display host
-      Envia superficies graficas para QemuHostVideoCallback. O listener inclui
-      o console 0 mesmo antes de ele se tornar grafico.
+      Envia superficies graficas para QemuHostD3D12VideoCallback quando ele
+      estiver registrado e a superficie tiver sido renderizada. O callback
+      CPU QemuHostVideoCallback permanece como fallback. O listener inclui o
+      console 0 mesmo antes de ele se tornar grafico.
 
   -display none
       Desabilita a entrega de display. Aceitavel para testes sem UI.
@@ -222,8 +224,9 @@ Ordem recomendada:
   2. Registrar callback de log.
   3. Registrar callback HLE externo, se usado. Ele deve ser registrado antes de
      qemu_host_init para que imports externos entrem na imagem HLE.
-  4. Registrar video, audio, pad output, storage, dialogs, rede, HTTP, media e
-     launch. Registrar antes do init evita perder eventos iniciais.
+  4. Registrar video D3D12 (preferencial) ou CPU, audio, pad output, storage,
+     dialogs, rede, HTTP, media e launch. Registrar antes do init evita perder
+     eventos iniciais.
   5. Montar argc/argv com strings validas.
   6. Chamar qemu_host_init.
   7. Escolher exatamente um modo de loop: thread interna ou step.
@@ -295,6 +298,11 @@ se a thread criada por qemu_host_start existir.
 
 8. API PUBLICA DE CICLO DE VIDA
 ===============================
+
+  uint32_t qemu_host_get_api_version(void)
+      Retorna 0x00010001 para a ABI 1.1. Os 16 bits superiores sao a versao
+      major e os inferiores a minor. O host deve rejeitar somente major
+      incompativel.
 
   int qemu_host_init(int argc, char **argv)
       Inicializa o QEMU e a maquina. Retorna 0 em sucesso, -EINVAL para entrada
@@ -375,6 +383,38 @@ O callback recebe pixels, width, height, stride e formato. Formatos existentes:
 O ponteiro de pixels pertence ao QEMU e so deve ser usado durante o callback.
 Copie o frame para memoria do host ou para um recurso grafico antes de retornar.
 stride pode ser maior que width * 4.
+
+Video D3D12 compartilhado (preferencial em UWP/Xbox):
+
+  qemu_host_register_d3d12_video_callback(callback, opaque)
+  qemu_host_d3d12_video_callback_enabled()
+
+O registro retorna 0 em Windows e -ENOSYS nas demais plataformas. O callback
+recebe QemuHostD3D12VideoFrame versao 1 com:
+
+  - frame_id, buffer_index, width e height;
+  - DXGI_FORMAT e D3D12_RESOURCE_STATES numericos;
+  - LUID do adapter usado pela DLL;
+  - handles compartilhados de ID3D12Resource e ID3D12Fence;
+  - valor que deve ser aguardado na fence;
+  - ponteiros emprestados para ID3D12Device, ID3D12CommandQueue,
+    ID3D12Resource e ID3D12Fence no mesmo processo.
+
+Os objetos e handles pertencem ao QEMU. Nao chame CloseHandle nem Release
+neles. Para o caminho de menor custo, grave durante o callback uma command
+list de copia na command_queue fornecida, fazendo COMMON -> COPY_SOURCE,
+copiando para o backbuffer e retornando o recurso para COMMON. O callback e
+sincrono; enfileirar na mesma queue antes do retorno garante que o proximo
+submit do QEMU fique ordenado depois da copia.
+
+Ao usar outro device, valide o LUID, abra resource_handle e fence_handle com
+ID3D12Device::OpenSharedHandle, aguarde fence_value e conclua a leitura antes
+do callback retornar. Usar outra queue sem essa sincronizacao cria uma corrida
+com a reutilizacao do render target.
+
+A DLL prioriza este callback somente para superficies VideoOut que receberam
+draw. Se o backend D3D12, o handle compartilhado ou a superficie renderizada
+nao estiver disponivel, ela preserva o readback/callback CPU como fallback.
 
 Audio:
 
@@ -491,6 +531,18 @@ Registre e monte antes de qemu_host_init():
   qemu_host_register_brokered_storage_callbacks(&callbacks, opaque);
 
   qemu_host_mount_brokered_folder("/brokered/title", folder_abi);
+
+Para a maquina shadPS4, a montagem recomendada do title selecionado e /title,
+alem do alias somente leitura /titles/<TITLE_ID>/app0 usado pelo guest:
+
+  qemu_host_mount_brokered_folder("/title", title_folder_abi);
+  qemu_host_mount_brokered_folder(
+      "/titles/CUSA00000/app0", title_folder_abi);
+
+Quando houver um StorageFolder gravavel dedicado a saves, monte-o em
+/titles/<TITLE_ID>/savedata. Se esse mount nao existir, mas /title existir, a
+DLL usa /title/.qemu-savedata como fallback persistente. Assim SaveData nao
+depende de um path Win32 nem tenta criar uma arvore virtual sem mount.
 
 Ou monte um unico arquivo junto do stream ja aberto:
 
@@ -700,6 +752,7 @@ dependencias empacotadas.
 
 Ciclo e estado:
 
+  qemu_host_get_api_version
   qemu_host_init
   qemu_host_start
   qemu_host_main_loop_step
@@ -717,6 +770,8 @@ Registro e callbacks:
   qemu_host_register_log_callback
   qemu_host_log_callback_enabled
   qemu_host_register_video_callback
+  qemu_host_register_d3d12_video_callback
+  qemu_host_d3d12_video_callback_enabled
   qemu_host_register_audio_callback
   qemu_host_register_pad_output_callback
   qemu_host_register_storage_callbacks
@@ -747,10 +802,11 @@ Encaminhamento/teste:
 
   qemu_host_emit_log
   qemu_host_emit_video_frame
+  qemu_host_emit_d3d12_video_frame
   qemu_host_emit_audio_frame
   qemu_host_emit_pad_output
 
-Total atual: 43 exports qemu_host_*.
+Total atual: 48 exports qemu_host_*.
 
 
 18. EXEMPLO C MINIMO
@@ -1044,6 +1100,18 @@ Saidas esperadas:
 Depois execute meson setup --reconfigure no build do QEMU. O Meson detecta a
 biblioteca, liga as tres funcoes spirv_to_dxil e copia
 libspirv_to_dxil.dll para a raiz do diretorio de build, ao lado da DLL QEMU.
+O DXIL produzido pelo Mesa precisa ser validado e assinado antes de criar PSOs.
+O Meson tambem procura o validator x64 em:
+
+  C:/Program Files (x86)/Windows Kits/10/Redist/D3D/x64/dxil.dll
+
+Se o SDK estiver em outro local, configure explicitamente:
+
+  meson setup --reconfigure build-shadps4-check \
+    -Dshadps4_dxil_runtime=C:/caminho/para/dxil.dll
+
+DXIL.dll deve ser incluido no package graph UWP, no mesmo diretorio das DLLs.
+No Xbox, use o runtime DXIL correspondente ao GDK da plataforma.
 Na inicializacao, o log correto contem:
 
   shadPS4 D3D12 backend initialized: ... self-test=ok
@@ -1065,10 +1133,13 @@ Saidas principais:
   build-shadps4-check/qemu-system-shadps4.dll
   build-shadps4-check/qemu-system-shadps4.dll.a
   build-shadps4-check/libspirv_to_dxil.dll
+  build-shadps4-check/libshadps4_gcn_bridge.dll
+  build-shadps4-check/DXIL.dll
 
 A primeira e a DLL embutivel. A segunda e a biblioteca de importacao MinGW.
-A terceira deve ser incluida no mesmo pacote UWP e no mesmo diretorio de carga
-da DLL principal.
+As DLLs de runtime devem ser incluidas no mesmo pacote UWP e no mesmo diretorio
+de carga da DLL principal. Sem DXIL.dll, o backend rejeita a traducao dinamica;
+sem libshadps4_gcn_bridge.dll, o frontend GCN nao fica disponivel.
 
 Para build incremental, repita apenas:
 
@@ -1164,6 +1235,9 @@ pasta de staging do pacote. Exemplo, ajuste DESTINO para o projeto UWP:
   mkdir -p "$DESTINO"
 
   cp build-shadps4-check/qemu-system-shadps4.dll "$DESTINO"/
+  cp build-shadps4-check/libspirv_to_dxil.dll "$DESTINO"/
+  cp build-shadps4-check/libshadps4_gcn_bridge.dll "$DESTINO"/
+  cp build-shadps4-check/DXIL.dll "$DESTINO"/
   cp /ucrt64/bin/libgcc_s_seh-1.dll "$DESTINO"/
   cp /ucrt64/bin/libwinpthread-1.dll "$DESTINO"/
   cp /ucrt64/bin/libglib-2.0-0.dll "$DESTINO"/
@@ -1197,6 +1271,15 @@ Ninja ou outros artefatos do diretorio de build no pacote final.
   - atualize o toolchain MSYS2;
   - confirme que xaudio2.h existe em /ucrt64/include;
   - confira build-shadps4-check/config.log e meson-logs/meson-log.txt.
+
+"DXIL validator is unavailable" ou CreateGraphicsPipelineState retorna
+0x80070057:
+
+  - confirme que DXIL.dll foi copiado para a raiz do build e para o pacote;
+  - em UWP, confirme que DXIL.dll faz parte do package graph;
+  - reconfigure com -Dshadps4_dxil_runtime=PATH quando a autodeteccao falhar;
+  - use SHADPS4_D3D12_DEBUG=1 somente em diagnostico desktop para obter as
+    mensagens da D3D12 InfoQueue.
 
 GTK/SDL aparecem como habilitados:
 

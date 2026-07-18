@@ -1,6 +1,13 @@
 MAPEAMENTO DO SHADPS4 PARA UMA MAQUINA QEMU X86_64 DEDICADA
 ======================================================================
 
+AVISO DE BUILD ATUAL (2026-07-18)
+----------------------------------------------------------------------
+As referencias historicas deste documento a "strip --strip-unneeded" estao
+obsoletas e NAO devem ser executadas. O artefato distribuido deve ser a DLL
+produzida diretamente pelo linker. Consulte qemu-system-shadps4-dll-usage.txt
+para o procedimento de build e auditoria vigente.
+
 Data da analise: 2026-07-13
 
 Arvore analisada:

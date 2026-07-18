@@ -37,6 +37,8 @@ static QemuHostLogCallback host_log_callback;
 static void *host_log_opaque;
 static QemuHostVideoCallback host_video_callback;
 static void *host_video_opaque;
+static QemuHostD3D12VideoCallback host_d3d12_video_callback;
+static void *host_d3d12_video_opaque;
 static QemuHostAudioCallback host_audio_callback;
 static void *host_audio_opaque;
 static QemuHostPadOutputCallback host_pad_output_callback;
@@ -81,6 +83,7 @@ typedef struct QemuHostBrokeredHandle {
 
 static GPtrArray *host_brokered_mounts;
 static GHashTable *host_brokered_handles;
+static GHashTable *host_brokered_reported_misses;
 static uint64_t host_next_brokered_handle = UINT64_C(0x4000000000000000);
 
 static bool host_brokered_path_valid(const char *path)
@@ -217,9 +220,36 @@ static void host_brokered_report_error(const char *operation,
 {
     int error = result <= INT_MIN ? EIO : -(int)result;
 
-    error_report("brokered storage %s failed: virtual='%s' relative='%s' "
-                 "errno=%d (%s)", operation, virtual_path ?: "<unknown>",
-                 relative_path ?: "<unknown>", error, strerror(error));
+    if (error == ENOENT) {
+        g_autofree char *key = g_strdup_printf("%s\n%s\n%s", operation,
+                                               virtual_path ?: "<unknown>",
+                                               relative_path ?: "<unknown>");
+        bool first;
+
+        g_mutex_lock(&host_callback_lock);
+        if (!host_brokered_reported_misses) {
+            host_brokered_reported_misses = g_hash_table_new_full(
+                g_str_hash, g_str_equal, g_free, NULL);
+        }
+        first = !g_hash_table_contains(host_brokered_reported_misses, key);
+        if (first) {
+            g_hash_table_add(host_brokered_reported_misses,
+                             g_steal_pointer(&key));
+        }
+        g_mutex_unlock(&host_callback_lock);
+        if (!first) {
+            return;
+        }
+        info_report("brokered storage %s missed: virtual='%s' relative='%s' "
+                    "errno=%d (%s)", operation,
+                    virtual_path ?: "<unknown>",
+                    relative_path ?: "<unknown>", error, strerror(error));
+    } else {
+        error_report("brokered storage %s failed: virtual='%s' relative='%s' "
+                     "errno=%d (%s)", operation,
+                     virtual_path ?: "<unknown>",
+                     relative_path ?: "<unknown>", error, strerror(error));
+    }
 }
 
 typedef struct QemuHostDialogResponse {
@@ -298,6 +328,51 @@ void qemu_host_emit_video_frame(const void *pixels, int width, int height,
     g_mutex_unlock(&host_callback_lock);
     if (cb) {
         cb(opaque, pixels, width, height, stride, format);
+    }
+}
+
+int qemu_host_register_d3d12_video_callback(
+    QemuHostD3D12VideoCallback cb, void *opaque)
+{
+#ifdef CONFIG_WIN32
+    g_mutex_lock(&host_callback_lock);
+    host_d3d12_video_callback = cb;
+    host_d3d12_video_opaque = opaque;
+    g_mutex_unlock(&host_callback_lock);
+    return 0;
+#else
+    (void)cb;
+    (void)opaque;
+    return -ENOSYS;
+#endif
+}
+
+bool qemu_host_d3d12_video_callback_enabled(void)
+{
+    bool enabled;
+
+    g_mutex_lock(&host_callback_lock);
+    enabled = host_d3d12_video_callback != NULL;
+    g_mutex_unlock(&host_callback_lock);
+    return enabled;
+}
+
+void qemu_host_emit_d3d12_video_frame(
+    const QemuHostD3D12VideoFrame *frame)
+{
+    QemuHostD3D12VideoCallback cb;
+    void *opaque;
+
+    if (!frame || frame->size < sizeof(*frame) ||
+        frame->version != QEMU_HOST_D3D12_VIDEO_FRAME_VERSION) {
+        return;
+    }
+    g_mutex_lock(&host_callback_lock);
+    cb = host_d3d12_video_callback;
+    opaque = host_d3d12_video_opaque;
+    g_mutex_unlock(&host_callback_lock);
+    if (cb) {
+        cb(opaque, frame);
     }
 }
 
@@ -1095,14 +1170,22 @@ int qemu_host_storage_mkdir(const char *path, int mode)
         if (ret == 0 && relative && !relative[0]) {
             return -EEXIST;
         }
-        return ret < 0 ? ret : brokered.mkdir_at ?
-               brokered.mkdir_at(opaque, folder, relative, mode) : -ENOSYS;
+        ret = ret < 0 ? ret : brokered.mkdir_at ?
+              brokered.mkdir_at(opaque, folder, relative, mode) : -ENOSYS;
+        if (ret < 0 && ret != -EEXIST) {
+            host_brokered_report_error("mkdir", path, relative, ret);
+        }
+        return ret;
     }
     g_mutex_lock(&host_callback_lock);
     cb = host_storage_callbacks.mkdir;
     opaque = host_storage_opaque;
     g_mutex_unlock(&host_callback_lock);
-    return cb ? cb(opaque, path, mode) : -ENOSYS;
+    ret = cb ? cb(opaque, path, mode) : -ENOSYS;
+    if (ret < 0 && ret != -EEXIST) {
+        host_brokered_report_error("mkdir", path, "<unmounted>", ret);
+    }
+    return ret;
 }
 
 int qemu_host_storage_unlink(const char *path)
@@ -1815,6 +1898,8 @@ int qemu_host_cleanup(void)
     host_log_opaque = NULL;
     host_video_callback = NULL;
     host_video_opaque = NULL;
+    host_d3d12_video_callback = NULL;
+    host_d3d12_video_opaque = NULL;
     host_audio_callback = NULL;
     host_audio_opaque = NULL;
     host_pad_output_callback = NULL;
@@ -1836,9 +1921,15 @@ int qemu_host_cleanup(void)
     g_queue_clear_full(&host_dialog_responses,
                        (GDestroyNotify)host_dialog_response_free);
     g_clear_pointer(&host_dialog_requests, g_hash_table_unref);
+    g_clear_pointer(&host_brokered_reported_misses, g_hash_table_unref);
     g_mutex_unlock(&host_callback_lock);
 
     return 0;
+}
+
+uint32_t qemu_host_get_api_version(void)
+{
+    return QEMU_HOST_API_VERSION;
 }
 
 bool qemu_host_is_initialized(void)

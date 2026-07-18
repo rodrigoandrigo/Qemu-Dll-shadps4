@@ -67,6 +67,8 @@ typedef struct ShadPS4GPUState {
     size_t surface_capacity;
     uint8_t *frame;
     size_t frame_capacity;
+    bool video_backend_valid;
+    bool last_video_d3d12;
     bool running;
 } ShadPS4GPUState;
 

@@ -157,7 +157,8 @@ def make_relocated_elf(path):
     expect_rax_small(0)
     emit("48 83 bb 00 03 00 00 55")   # fence completed
     jne_failure()
-    emit("c7 83 08 01 00 00 03 00 00 00")  # append invalid PM4 header
+    emit("c7 83 08 02 00 00 03 00 00 00")  # append invalid PM4 header
+    emit("c7 83 08 01 00 00 03 00 00 00")  # include it in submission
     emit("4c 89 e7 be 01 81 10 c0 48 8d 93 00 01 00 00")
     syscall(54)                         # reject without partial PM4 commit
     expect_rax_small(-22)
@@ -173,6 +174,7 @@ def make_relocated_elf(path):
     emit("48 89 83 08 04 00 00")
     emit("48 b8 08 00 00 00 01 00 00 00")    # stride=8, BGRA
     emit("48 89 83 10 04 00 00")
+    emit("c7 83 1c 04 00 00 01 00 00 00")     # linear tiling mode
     emit("48 b8 00 11 22 33 44 55 66 77")
     emit("48 89 83 00 10 00 00")
     emit("48 b8 88 99 aa bb cc dd ee ff")
@@ -1506,7 +1508,7 @@ def run_test(dll_path):
                 bytes.fromhex("31 f6 31 d2"),
                 [bytes.fromhex("48 85 c0"),
                  b"\x48\xbf" + struct.pack("<Q", VIRTUAL_BASE + 0x1900) +
-                 bytes.fromhex("48 81 3f 01 04 00 00")],
+                 bytes.fromhex("48 8b 3f 83 7f 20 01")],
             ),
             (
                 "pthread-cond", "2Tb92quprl0", "libkernel",
@@ -1674,7 +1676,7 @@ def run_test(dll_path):
             ),
             (
                 "hmd-stub", "rU3HK9Q0r8o", "libSceHmd", b"",
-                [bytes.fromhex("48 85 c0")],
+                [bytes.fromhex("3d 02 00 11 81")],
             ),
             (
                 "np-tus-stub", "lL+Z3zCKNTs", "libSceNpTus", b"",
@@ -1707,7 +1709,7 @@ def run_test(dll_path):
             ("system-state-stub", "6gtqLPVTdJY", "libSceSystemStateMgr", b"",
              [bytes.fromhex("48 85 c0")]),
             ("camera-stub", "0wnf2a60FqI", "libSceCamera", b"",
-             [bytes.fromhex("48 85 c0")]),
+             [bytes.fromhex("3d 02 00 2e 80")]),
             ("np-party-stub", "+v4fVHMwFWc", "libSceNpParty", b"",
              [bytes.fromhex("48 85 c0")]),
             ("app-content-stub", "+OlXCu8qxUk", "libSceAppContent", b"",
@@ -1739,23 +1741,23 @@ def run_test(dll_path):
             ("net-bwe-stub", "0lViPaTB-R8", "libSceNetBwe", b"",
              [bytes.fromhex("48 85 c0")]),
             ("web-browser-dialog-stub", "Cya+jvTtPqg", "libSceWebBrowserDialog", b"", [bytes.fromhex("48 85 c0")]),
-            ("signin-dialog-stub", "2m077aeC+PA", "libSceSigninDialog", b"", [bytes.fromhex("48 85 c0")]),
+            ("signin-dialog-stub", "2m077aeC+PA", "libSceSigninDialog", b"", [bytes.fromhex("48 83 f8 03")]),
             ("activate-hevc-stub", "+2uXfrrQCyk", "libSceSystemServiceActivateHevc", b"", [bytes.fromhex("48 85 c0")]),
             ("activate-hevc-soft-stub", "djVe06YjzkI", "libSceSystemServiceActivateHevcSoft", b"", [bytes.fromhex("48 85 c0")]),
             ("hmd-setup-dialog-stub", "+z4OJmFreZc", "libSceHmdSetupDialog", b"", [bytes.fromhex("48 85 c0")]),
             ("activate-mpeg2-stub", "-7zMNJ1Ap1c", "libSceSystemServiceActivateMpeg2", b"", [bytes.fromhex("48 85 c0")]),
-            ("np-party-compat-stub", "F1P+-wpxQow", "libSceNpPartyCompat", b"", [bytes.fromhex("48 85 c0")]),
+            ("np-party-compat-stub", "F1P+-wpxQow", "libSceNpPartyCompat", b"", [bytes.fromhex("3d 06 25 55 80")]),
             ("hmd-distortion-stub", "8A4T5ahi790", "libSceHmdDistortion", b"", [bytes.fromhex("48 85 c0")]),
             ("netctl-v6-stub", "+lxqIKeU9UY", "libSceNetCtlV6", b"", [bytes.fromhex("48 85 c0")]),
             ("gnm-resource-stub", "+RaJBCVJZVM", "libSceGnmDriverResourceRegistration", b"", [bytes.fromhex("48 85 c0")]),
             ("vr-gpu-test-stub", "5ucmy8hcSPk", "libSceVrTrackerGpuTest", b"", [bytes.fromhex("48 85 c0")]),
             ("np-webapi2-stub", "2hlBNB96saE", "libSceNpWebApi2", b"", [bytes.fromhex("48 85 c0")]),
-            ("companion-util-stub", "cE5Msy11WhU", "libSceCompanionUtil", b"", [bytes.fromhex("48 85 c0")]),
+            ("companion-util-stub", "cE5Msy11WhU", "libSceCompanionUtil", b"", [bytes.fromhex("3d 08 00 e4 80")]),
             ("vr-live-capture-stub", "3YCwwpHkHIg", "libSceVrTrackerLiveCapture", b"", [bytes.fromhex("48 85 c0")]),
             ("common-dialog-stub", "2RdicdHhtGA", "libSceCommonDialog", b"",
              [bytes.fromhex("48 85 c0")]),
             ("np-manager-stub", "uqcPJLWL08M", "libSceNpManager", b"",
-             [bytes.fromhex("48 85 c0")]),
+             [bytes.fromhex("3d 14 00 55 80")]),
             ("np-common-cmp", "i8UmXTSq7N4", "libSceNpCommon", b"\x48\x89\xe7\x48\x89\xe6",
              [bytes.fromhex("48 85 c0")]),
             ("np-common-cmp-invalid", "i8UmXTSq7N4", "libSceNpCommon",
@@ -1952,9 +1954,9 @@ def run_test(dll_path):
             ("content-export-stub", "FzEWeYnAFlI", "libSceContentExport", b"",
              [bytes.fromhex("48 85 c0")]),
             ("np-partner-stub", "pMxXhNozUX8", "libSceNpPartner001", b"",
-             [bytes.fromhex("48 85 c0")]),
+             [bytes.fromhex("3d 01 00 9d 81")]),
             ("videodec-stub", "U0kpGF1cl90", "libSceVideodec", b"",
-             [bytes.fromhex("48 85 c0")]),
+             [bytes.fromhex("3d 02 00 c1 80")]),
             ("error-dialog-stub", "jrpnVQfJYgQ", "libSceErrorDialog", b"",
              [bytes.fromhex("48 85 c0")]),
             ("playgo-stub", "uEqMfMITvEI", "libSceDbgPlayGo", b"",
@@ -1962,17 +1964,17 @@ def run_test(dll_path):
             ("pngdec-stub", "cJ--1xAbj-I", "libScePngDec", b"",
              [bytes.fromhex("48 85 c0")]),
             ("jpeg-enc-stub", "QbrU0cUghEM", "libSceJpegEnc", b"",
-             [bytes.fromhex("48 85 c0")]),
+             [bytes.fromhex("3d 04 01 65 80")]),
             ("np-auth-stub", "PM3IZCw-7m0", "libSceNpAuth", b"",
              [bytes.fromhex("48 85 c0")]),
             ("np-profile-dialog-stub", "nrQRlLKzdwE", "libSceNpProfileDialog", b"",
-             [bytes.fromhex("48 85 c0")]),
+             [bytes.fromhex("3d 06 00 b8 80")]),
             ("np-facebook-dialog-stub", "fjV7C8H0Y8k", "libSceNpSnsFacebookDialog", b"",
              [bytes.fromhex("48 85 c0")]),
             ("video-out-stub", "MTxxrOCeSig", "libSceVideoOut", b"",
              [bytes.fromhex("48 85 c0")]),
             ("video-recording-stub", "Fc8qxlKINYQ", "libSceVideoRecording", b"",
-             [bytes.fromhex("48 85 c0")]),
+             [bytes.fromhex("3d 03 00 a8 80")]),
             ("residual-common-unused", "BQ3tey0JmQM", "libSceCommonDialog", b"",
              [bytes.fromhex("48 85 c0")]),
             ("residual-companion-event", "Vku4big+IYM", "libSceCompanionHttpd",
@@ -2153,7 +2155,7 @@ def run_test(dll_path):
              str(fault_elf), str(fault_trace), "fault"], check=True)
         trace = fault_trace.read_text(encoding="utf-8")
         assert f"0x{VIRTUAL_BASE + 0x1000 + failure_offset:x}" in trace
-        assert "0x0000b000" in trace
+        assert "0x0000b060" in trace
 
         malformed = temp / "malformed-tls-size.elf"
         make_relocated_elf(malformed)

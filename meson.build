@@ -89,7 +89,10 @@ have_user = have_linux_user or have_bsd_user
 # Programs #
 ############
 
-sh = find_program('sh')
+sh = find_program('sh', required: false)
+if not sh.found() and host_os == 'windows'
+  sh = find_program('C:/msys64/usr/bin/sh.exe')
+endif
 python = import('python').find_installation()
 
 cc = meson.get_compiler('c')
@@ -3835,6 +3838,11 @@ endif
 if is_variable('shadps4_dxil_runtime')
   configure_file(input: shadps4_dxil_runtime,
                  output: 'libspirv_to_dxil.dll',
+                 copy: true)
+endif
+if is_variable('shadps4_validator_runtime') and shadps4_validator_runtime != ''
+  configure_file(input: shadps4_validator_runtime,
+                 output: 'DXIL.dll',
                  copy: true)
 endif
 

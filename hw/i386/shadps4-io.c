@@ -422,24 +422,37 @@ bool shadps4_io_configure_audio(ShadPS4IOState *io, int rate, int channels,
 bool shadps4_io_emit_audio(ShadPS4IOState *io, CPUState *cs,
                            uint64_t guest_addr, size_t size)
 {
-    g_autofree uint8_t *samples = NULL;
-    size_t sample_size = io->audio_format == QEMU_HOST_AUDIO_FORMAT_U8 ? 1 :
-                         io->audio_format == QEMU_HOST_AUDIO_FORMAT_S16 ? 2 : 4;
+    return shadps4_io_emit_audio_format(
+        io, cs, guest_addr, size, io->audio_rate, io->audio_channels,
+        io->audio_format, true);
+}
 
-    if (!size || size > SHADPS4_AUDIO_MAX_CHUNK ||
-        size % (sample_size * io->audio_channels)) {
+bool shadps4_io_emit_audio_format(ShadPS4IOState *io, CPUState *cs,
+                                  uint64_t guest_addr, size_t size,
+                                  int rate, int channels,
+                                  QemuHostAudioFormat format,
+                                  bool local_playback)
+{
+    g_autofree uint8_t *samples = NULL;
+    size_t sample_size = format == QEMU_HOST_AUDIO_FORMAT_U8 ? 1 :
+                         format == QEMU_HOST_AUDIO_FORMAT_S16 ? 2 : 4;
+
+    if (rate < 8000 || rate > 192000 || channels < 1 || channels > 8 ||
+        format < QEMU_HOST_AUDIO_FORMAT_U8 ||
+        format > QEMU_HOST_AUDIO_FORMAT_F32 || !size ||
+        size > SHADPS4_AUDIO_MAX_CHUNK || size % (sample_size * channels)) {
         return false;
     }
     samples = g_malloc(size);
     if (cpu_memory_rw_debug(cs, guest_addr, samples, size, false)) {
         return false;
     }
-    if (size > SHADPS4_AUDIO_MAX_QUEUE - shadps4_io_audio_queued(io)) {
+    if (local_playback &&
+        size > SHADPS4_AUDIO_MAX_QUEUE - shadps4_io_audio_queued(io)) {
         return false;
     }
-    qemu_host_emit_audio_frame(samples, size, io->audio_rate,
-                               io->audio_channels, io->audio_format);
-    if (io->audio_voice) {
+    qemu_host_emit_audio_frame(samples, size, rate, channels, format);
+    if (local_playback && io->audio_voice) {
         if (!shadps4_io_audio_queued(io)) {
             g_byte_array_set_size(io->audio_queue, 0);
             io->audio_queue_offset = 0;

@@ -1293,6 +1293,13 @@ typedef struct ShadPS4HLEHeapAllocation {
     bool active;
 } ShadPS4HLEHeapAllocation;
 
+typedef int (*ShadPS4HLEThreadStart)(void *opaque, uint64_t handle,
+                                     uint64_t entry, uint64_t argument,
+                                     uint64_t stack_pointer,
+                                     uint64_t gs_base);
+typedef void (*ShadPS4HLEThreadExit)(void *opaque, CPUState *cs,
+                                     uint64_t handle, uint64_t result);
+
 typedef struct ShadPS4HLEState {
     AddressSpace *as;
     ShadPS4GPUState *gpu;
@@ -1344,12 +1351,20 @@ typedef struct ShadPS4HLEState {
     char last_hle_library[64];
     char last_hle_module[64];
     uint64_t last_hle_return_address;
+    uint64_t hle_trace_call_count;
+    void *thread_opaque;
+    ShadPS4HLEThreadStart thread_start;
+    ShadPS4HLEThreadExit thread_exit;
+    uint64_t cpu_thread_handles[8];
+    uint64_t cpu_wait_mutex[8];
     uint32_t hle_history_head;
     uint32_t hle_history_count;
     ShadPS4HLECallHistory hle_history[SHADPS4_HLE_HISTORY_SIZE];
     bool neo_mode;
     uint64_t gnm_tessellation_ring_addr;
     uint64_t gnm_submit_failures;
+    uint32_t gnm_compat_seen_count;
+    char gnm_compat_seen[64][12];
     uint64_t video_flip_failures;
     bool video_open;
     uint32_t video_flip_rate;
@@ -1409,6 +1424,7 @@ typedef struct ShadPS4HLEState {
     bool save_data_initialized;
     bool save_data_mounted;
     char save_data_dir[33];
+    char save_data_root[192];
     float save_data_progress;
     bool save_memory_ready[4];
     uint64_t save_memory_size[4];
@@ -1463,6 +1479,9 @@ void shadps4_hle_init(ShadPS4HLEState *hle, AddressSpace *as,
                       ShadPS4GPUState *gpu, ShadPS4IOState *io,
                       const char *title_id,
                       uint64_t dynamic_pd_phys, uint64_t dynamic_virt_base);
+void shadps4_hle_set_thread_callbacks(ShadPS4HLEState *hle, void *opaque,
+                                      ShadPS4HLEThreadStart start,
+                                      ShadPS4HLEThreadExit exit);
 bool shadps4_hle_reset(ShadPS4HLEState *hle, uint64_t dynamic_phys_base,
                        uint64_t physical_limit, Error **errp);
 void shadps4_hle_cleanup(ShadPS4HLEState *hle);

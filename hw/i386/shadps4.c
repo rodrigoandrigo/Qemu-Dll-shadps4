@@ -12,6 +12,7 @@
 #include "qemu/qemu-host.h"
 #include "qemu/units.h"
 #include "qapi/error.h"
+#include "exec/cputlb.h"
 #include "hw/core/boards.h"
 #include "hw/i386/apic.h"
 #include "hw/i386/x86.h"
@@ -819,6 +820,78 @@ static bool shadps4_prepare_boot_cpu(ShadPS4MachineState *sms, Error **errp)
                 " rsp=0x%" PRIx64 " gs=0x%" PRIx64 " cr3=0x%x",
                 env->eip, env->regs[R_ESP], gs_base, SHADPS4_PML4_PHYS);
     return true;
+}
+
+static int shadps4_start_guest_thread(void *opaque, uint64_t handle,
+                                      uint64_t entry, uint64_t argument,
+                                      uint64_t stack_pointer,
+                                      uint64_t gs_base)
+{
+    ShadPS4MachineState *sms = opaque;
+    CPUState *cs;
+    CPUX86State *env;
+    uint32_t code_flags = DESC_P_MASK | DESC_S_MASK | DESC_CS_MASK |
+        DESC_R_MASK | DESC_A_MASK | DESC_L_MASK | DESC_G_MASK | DESC_DPL_MASK;
+    uint32_t data_flags = DESC_P_MASK | DESC_S_MASK | DESC_W_MASK |
+        DESC_A_MASK | DESC_B_MASK | DESC_G_MASK | DESC_DPL_MASK;
+    Error *local_err = NULL;
+
+    CPU_FOREACH(cs) {
+        if (cs->cpu_index &&
+            !sms->hle.cpu_thread_handles[cs->cpu_index]) {
+            break;
+        }
+    }
+    if (!cs) {
+        return -EAGAIN;
+    }
+    env = &X86_CPU(cs)->env;
+    if (!shadps4_build_descriptor_tables(env, &local_err)) {
+        error_report_err(local_err);
+        return -EINVAL;
+    }
+    env->xcr0 = XSTATE_FP_MASK | XSTATE_SSE_MASK | XSTATE_YMM_MASK;
+    cpu_x86_update_cr4(env, CR4_PAE_MASK | CR4_PSE_MASK |
+                       CR4_OSFXSR_MASK | CR4_OSXMMEXCPT_MASK |
+                       CR4_OSXSAVE_MASK);
+    env->efer = MSR_EFER_LME | MSR_EFER_NXE | MSR_EFER_SCE;
+    cpu_x86_update_cr3(env, SHADPS4_PML4_PHYS);
+    cpu_x86_update_cr0(env, env->cr[0] | CR0_PE_MASK | CR0_NE_MASK |
+                       CR0_WP_MASK | CR0_PG_MASK);
+    env->star = (0x10ULL << 48) | (0x08ULL << 32);
+    env->lstar = SHADPS4_SYSCALL_STUB_PHYS;
+    env->cstar = SHADPS4_SYSCALL_STUB_PHYS;
+    env->fmask = IF_MASK | TF_MASK | DF_MASK;
+    cpu_x86_load_seg_cache(env, R_CS, 0x23, 0, UINT32_MAX, code_flags);
+    cpu_x86_load_seg_cache(env, R_SS, 0x1b, 0, UINT32_MAX, data_flags);
+    cpu_x86_load_seg_cache(env, R_DS, 0x1b, 0, UINT32_MAX, data_flags);
+    cpu_x86_load_seg_cache(env, R_ES, 0x1b, 0, UINT32_MAX, data_flags);
+    cpu_x86_load_seg_cache(env, R_FS, 0, 0, UINT32_MAX, data_flags);
+    cpu_x86_load_seg_cache(env, R_GS, 0, gs_base, UINT32_MAX, data_flags);
+    memset(env->regs, 0, sizeof(env->regs));
+    env->eip = entry;
+    env->regs[R_ESP] = stack_pointer;
+    env->regs[R_EDI] = argument;
+    env->eflags = 0x2 | IF_MASK;
+    cs->exception_index = -1;
+    sms->hle.cpu_thread_handles[cs->cpu_index] = handle;
+    cs->halted = 0;
+    cpu_reset_interrupt(cs, CPU_INTERRUPT_HALT);
+    tlb_flush(cs);
+    qemu_cpu_kick(cs);
+    info_report("shadPS4 guest thread started: handle=%#" PRIx64
+                " cpu=%d entry=%#" PRIx64 " stack=%#" PRIx64,
+                handle, cs->cpu_index, entry, stack_pointer);
+    return 0;
+}
+
+static void shadps4_exit_guest_thread(void *opaque, CPUState *cs,
+                                      uint64_t handle, uint64_t result)
+{
+    cpu_interrupt(cs, CPU_INTERRUPT_HALT);
+    info_report("shadPS4 guest thread exited: handle=%#" PRIx64
+                " cpu=%d result=%#" PRIx64,
+                handle, cs->cpu_index, result);
 }
 
 static bool shadps4_machine_get_execute(Object *obj, Error **errp)
@@ -5063,6 +5136,9 @@ static void shadps4_machine_init(MachineState *machine)
                      sms->title_id ? sms->title_id : "UNCONFIGURED",
                      SHADPS4_PD_DYNAMIC_PHYS,
                      SHADPS4_DYNAMIC_VIRT_BASE);
+    shadps4_hle_set_thread_callbacks(&sms->hle, sms,
+                                     shadps4_start_guest_thread,
+                                     shadps4_exit_guest_thread);
     sms->hle.neo_mode = sms->variant == SHADPS4_VARIANT_NEO;
     memory_region_init_io(&sms->hle_gateway, OBJECT(sms),
                           &shadps4_hle_gateway_ops, sms,

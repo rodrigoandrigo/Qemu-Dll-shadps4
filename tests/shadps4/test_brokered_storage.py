@@ -160,6 +160,7 @@ def run(dll_path):
     qemu.qemu_host_init.argtypes = (
         ctypes.c_int, ctypes.POINTER(ctypes.c_char_p))
     qemu.qemu_host_init.restype = ctypes.c_int
+    qemu.qemu_host_get_api_version.restype = ctypes.c_uint32
     qemu.qemu_host_request_shutdown.restype = ctypes.c_int
     qemu.qemu_host_main_loop_step.argtypes = (
         ctypes.c_bool, ctypes.POINTER(ctypes.c_int))
@@ -248,11 +249,13 @@ def run(dll_path):
 
     assert qemu.qemu_host_register_brokered_storage_callbacks(
         ctypes.byref(callbacks), None) == 0
+    assert qemu.qemu_host_get_api_version() == 0x00010001
     folder = ctypes.c_void_p(0x1234)
     storage_file = ctypes.c_void_p(0x2345)
     stream = ctypes.c_void_p(0x3456)
     assert qemu.qemu_host_mount_brokered_folder(
         b"/brokered/title", folder) == 0
+    assert qemu.qemu_host_mount_brokered_folder(b"/title", folder) == 0
     assert qemu.qemu_host_mount_brokered_file(
         b"/brokered/title/eboot.bin", storage_file, stream) == 0
 
@@ -279,7 +282,8 @@ def run(dll_path):
     else:
         raise AssertionError("brokered-storage worker did not stop")
     assert qemu.qemu_host_cleanup() == 0
-    assert retained == [folder.value, storage_file.value, stream.value]
+    assert retained == [folder.value, folder.value,
+                        storage_file.value, stream.value]
     assert sorted(released) == sorted(retained)
     assert not handles
 

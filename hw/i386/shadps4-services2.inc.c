@@ -262,10 +262,10 @@ static uint64_t shadps4_hle_save_backup_operation(ShadPS4HLEState *hle,
                                   sizeof(directory))) {
         return SHADPS4_SAVE_ERROR_PARAMETER;
     }
-    g_snprintf(source, sizeof(source), "/titles/%s/savedata/%s",
-               hle->title_id, directory);
-    g_snprintf(destination, sizeof(destination),
-               "/titles/%s/savedata-backup/%s", hle->title_id, directory);
+    g_snprintf(source, sizeof(source), "%s/%s",
+               hle->save_data_root, directory);
+    g_snprintf(destination, sizeof(destination), "%s-backup/%s",
+               hle->save_data_root, directory);
     if (operation == SHADPS4_HLE_SAVE_DATA_CHECK_BACKUP) {
         return qemu_host_storage_stat(destination, &stat) < 0 ?
                SHADPS4_SAVE_ERROR_NOT_FOUND : 0;
@@ -279,8 +279,8 @@ static uint64_t shadps4_hle_save_backup_operation(ShadPS4HLEState *hle,
     } else {
         char parent[192];
 
-        g_snprintf(parent, sizeof(parent), "/titles/%s/savedata-backup",
-                   hle->title_id);
+        g_snprintf(parent, sizeof(parent), "%s-backup",
+                   hle->save_data_root);
         ret = qemu_host_storage_mkdir(parent, 0777);
         if (ret < 0 && ret != -EEXIST) {
             return SHADPS4_SAVE_ERROR_INTERNAL;
