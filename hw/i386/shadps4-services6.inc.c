@@ -465,7 +465,7 @@ static uint64_t shadps4_hle_dispatch_services6(
     case SHADPS4_HLE_COMPANION_GET_EVENT:
         stl_le_p(data, UINT32_C(0x10000002));
         return shadps4_services6_rw(cs, a0, data, sizeof(data), true) ?
-               UINT32_C(0x80e40008) : -SHADPS4_GUEST_EFAULT;
+               0 : -SHADPS4_GUEST_EFAULT;
     case SHADPS4_HLE_ERROR_DIALOG_INIT:
         if (hle->error_dialog_status) return SHADPS4_COMMON_ALREADY_INITIALIZED;
         hle->error_dialog_status = 1;

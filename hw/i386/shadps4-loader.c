@@ -13,6 +13,7 @@
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
 #include "qemu/cutils.h"
+#include "qemu/error-report.h"
 #include "qemu/qemu-host.h"
 #include "qemu/units.h"
 #include "elf.h"
@@ -87,6 +88,10 @@ typedef struct ShadPS4DynamicInfo {
     uint64_t jmprel;
     uint64_t pltrelsz;
     uint64_t pltrel;
+    uint64_t init;
+    uint64_t fini;
+    bool init_present;
+    bool fini_present;
 } ShadPS4DynamicInfo;
 
 static void shadps4_encode_id(uint16_t value, char encoded[4])
@@ -419,6 +424,14 @@ static bool shadps4_parse_dynamic(const uint8_t *dynamic,
             break;
         }
         switch (tag) {
+        case DT_INIT:
+            info->init = value;
+            info->init_present = true;
+            break;
+        case DT_FINI:
+            info->fini = value;
+            info->fini_present = true;
+            break;
         case SHADPS4_DT_SCE_STRTAB:
             info->strtab = value;
             break;
@@ -624,10 +637,6 @@ static bool shadps4_apply_relocations(const uint8_t *table,
             symbol = &symbols[symbol_index];
             binding = ELF64_ST_BIND(symbol->st_info);
             if (le16_to_cpu(symbol->st_shndx) == SHN_UNDEF) {
-                if (binding == STB_WEAK) {
-                    value = 0;
-                    break;
-                }
                 ShadPS4PendingRelocation *pending =
                     &image->pending_relocations[
                         image->pending_relocation_count++];
@@ -636,6 +645,7 @@ static bool shadps4_apply_relocations(const uint8_t *table,
                 pending->addend = addend;
                 pending->symbol_index = symbol_index;
                 pending->type = type;
+                pending->weak = binding == STB_WEAK;
                 image->unresolved_relocation_count++;
                 continue;
             }
@@ -658,6 +668,22 @@ static bool shadps4_apply_relocations(const uint8_t *table,
         }
 
         value_le = cpu_to_le64(value);
+        if (g_getenv("SHADPS4_LINK_TRACE") &&
+            relocation_offset == 0x5ff6d0) {
+            const ShadPS4DynamicSymbol *resolved_symbol =
+                symbol_index < image->symbol_count ?
+                &image->symbols[symbol_index] : NULL;
+
+            info_report("shadPS4 relocation trace: image='%s' "
+                        "offset=%#" PRIx64 " type=%u symbol=%u NID='%s' "
+                        "defined=%d value=%#" PRIx64,
+                        image->name ?: "<anonymous>", relocation_offset,
+                        type, symbol_index,
+                        resolved_symbol && resolved_symbol->nid ?
+                            resolved_symbol->nid : "",
+                        resolved_symbol ? resolved_symbol->defined : 0,
+                        value);
+        }
         if (address_space_write(as, physical_addr, MEMTXATTRS_UNSPECIFIED,
                                 &value_le, sizeof(value_le)) != MEMTX_OK) {
             error_setg(errp, "failed to write relocated value");
@@ -681,6 +707,15 @@ static bool shadps4_process_dynamic(const uint8_t *dynamic,
     uint64_t i;
 
     if (!shadps4_parse_dynamic(dynamic, dynamic_size, &info, errp)) {
+        return false;
+    }
+    image->init_present = info.init_present;
+    image->fini_present = info.fini_present;
+    if ((info.init_present &&
+         !shadps4_add_valid(image->virtual_base, info.init, &image->init)) ||
+        (info.fini_present &&
+         !shadps4_add_valid(image->virtual_base, info.fini, &image->fini))) {
+        error_setg(errp, "module initializer address overflows");
         return false;
     }
     if (!shadps4_dynamic_range(info.strtab, info.strsz, dynamic_data_size,
@@ -1165,6 +1200,40 @@ static bool shadps4_symbols_match(const ShadPS4DynamicSymbol *import,
            !strcmp(import->module, export->module);
 }
 
+static bool shadps4_prefer_hle_heap_provider(
+    const ShadPS4ImageInfo *consumer, const ShadPS4DynamicSymbol *import)
+{
+    static const char *const heap_nids[] = {
+        "gQX+4GDQjpM", /* malloc */
+        "tIhsqj0qsFE", /* free */
+        "2X5agFjKxMc", /* calloc */
+        "Y7aJ1uydPMo", /* realloc */
+        "Ujf3KzMvRmI", /* memalign */
+        "cVSk9y8URbc", /* posix_memalign */
+        "NDcSfcYZRC8", /* malloc_usable_size */
+    };
+    size_t i;
+
+    /*
+     * The PS2 compiler runs as a separately bootstrapped guest process and
+     * cannot use the title's libc allocator instance.  Other images must keep
+     * their allocator family inside their own libc; mixing an HLE allocation
+     * with a libc free corrupts libc's heap metadata.
+     */
+    if (!consumer || g_strcmp0(consumer->name, "ps2-emu-compiler.self") ||
+        !import->nid ||
+        (g_strcmp0(import->module, "libc") &&
+         g_strcmp0(import->module, "libSceLibcInternal"))) {
+        return false;
+    }
+    for (i = 0; i < ARRAY_SIZE(heap_nids); i++) {
+        if (!strcmp(import->nid, heap_nids[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool shadps4_link_modules(AddressSpace *as, ShadPS4ImageInfo **images,
                           uint32_t image_count, Error **errp)
 {
@@ -1183,6 +1252,8 @@ bool shadps4_link_modules(AddressSpace *as, ShadPS4ImageInfo **images,
             uint64_t value = 0;
             uint64_t value_le;
             bool resolved = false;
+            bool prefer_hle;
+            uint32_t provider_order;
             uint32_t provider_index;
 
             if (relocation->applied) {
@@ -1194,9 +1265,14 @@ bool shadps4_link_modules(AddressSpace *as, ShadPS4ImageInfo **images,
                 return false;
             }
             import = &image->symbols[relocation->symbol_index];
-            for (provider_index = 0;
-                 provider_index < image_count && !resolved;
-                 provider_index++) {
+            prefer_hle = shadps4_prefer_hle_heap_provider(image, import);
+            for (provider_order = 0;
+                 provider_order < image_count && !resolved;
+                 provider_order++) {
+                /* shadps4.c appends the synthetic HLE image last. */
+                provider_index = prefer_hle ?
+                    (provider_order ? provider_order - 1 : image_count - 1) :
+                    provider_order;
                 const ShadPS4ImageInfo *provider = images[provider_index];
                 uint32_t symbol_index;
 
@@ -1210,12 +1286,42 @@ bool shadps4_link_modules(AddressSpace *as, ShadPS4ImageInfo **images,
                                            export->value, &value)) {
                         continue;
                     }
+                    const char *link_trace = g_getenv("SHADPS4_LINK_TRACE");
+
+                    if (link_trace &&
+                        (!strcmp(link_trace, "all") ||
+                         strstr(import->library ?: "", "Ipmi") ||
+                         strstr(import->module ?: "", "Ipmi"))) {
+                        info_report("shadPS4 link: image='%s' NID='%s' "
+                                    "library='%s' module='%s' provider='%s' "
+                                    "offset=%#" PRIx64 " target=%#" PRIx64,
+                                    image->name ?: "<anonymous>",
+                                    import->nid ?: "", import->library ?: "",
+                                    import->module ?: "",
+                                    provider->name ?: "<HLE>",
+                                    relocation->physical_addr -
+                                        image->physical_base,
+                                    value);
+                    }
                     resolved = true;
                     break;
                 }
             }
             if (!resolved) {
-                continue;
+                if (!relocation->weak) {
+                    continue;
+                }
+                value = 0;
+                if (g_getenv("SHADPS4_LINK_TRACE")) {
+                    info_report("shadPS4 weak import unresolved: image='%s' "
+                                "NID='%s' library='%s' module='%s' "
+                                "offset=%#" PRIx64,
+                                image->name ?: "<anonymous>",
+                                import->nid ?: "", import->library ?: "",
+                                import->module ?: "",
+                                relocation->physical_addr -
+                                    image->physical_base);
+                }
             }
             if (relocation->type == R_X86_64_64 &&
                 !shadps4_add_signed_valid(value, relocation->addend,

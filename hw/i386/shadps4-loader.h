@@ -39,6 +39,7 @@ typedef struct ShadPS4PendingRelocation {
     int64_t addend;
     uint32_t symbol_index;
     uint32_t type;
+    bool weak;
     bool applied;
 } ShadPS4PendingRelocation;
 
@@ -50,6 +51,10 @@ typedef struct ShadPS4ImageInfo {
     uint64_t physical_base;
     uint64_t entry;
     uint64_t physical_entry;
+    uint64_t init;
+    uint64_t fini;
+    bool init_present;
+    bool fini_present;
     uint64_t image_size;
     uint64_t proc_param_addr;
     uint64_t proc_param_size;

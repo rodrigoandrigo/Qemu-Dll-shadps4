@@ -11,6 +11,18 @@ Run after building qemu-system-shadps4.dll:
   python tests/shadps4/test_loader.py \
     build-shadps4-check/qemu-system-shadps4.dll
 
+Optional local-title smoke tests (commercial title data is never bundled):
+
+  python tests/shadps4/test_titles.py \
+    build-shadps4-check/qemu-system-shadps4.dll
+
+The default matrix is CUSA02456, CUSA13032 and the PS2 Classics title
+SLES50541. Use --title to select one title and --duration to change the run
+time. SLES50541 exercises the Orbis PS2-emulator wrapper and its internal
+libkernel_ps2emu, menu-dialog, video-recording and coredump imports.
+The title test fails on premature guest shutdown, a nonzero guest status,
+missing video callbacks, or a run in which every delivered frame is black.
+
 The test covers:
   - ET_SCE_DYNEXEC and FreeBSD ABI validation;
   - PT_DYNAMIC and PT_SCE_DYNLIBDATA parsing;
@@ -25,7 +37,7 @@ The test covers:
   - x86_64 user page tables, stack, long mode, RIP and RSP;
   - CPL3 code/data selectors and supervisor-only low bootstrap memory;
   - Orbis-style entry parameters and process-exit trampoline;
-  - initial TCB/DTV area and GS base;
+  - initial TCB/DTV area and compatible FS/GS TLS bases;
   - GDT, IDT and 64-bit TSS with an exception stop handler;
   - SYSCALL/SYSRET transition through the supervisor HLE gateway;
   - identity, time, thread ID and FreeBSD ENOSYS behavior;

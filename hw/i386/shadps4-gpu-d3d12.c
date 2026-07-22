@@ -62,9 +62,14 @@
 #define SHADPS4_SHADER_MAX_BYTES (16 * 1024 * 1024)
 #define SHADPS4_SHADER_CACHE_SIZE 256
 #define SHADPS4_PIPELINE_CACHE_SIZE 128
-#define SHADPS4_DESCRIPTOR_PAGES 64
+#define SHADPS4_DESCRIPTORS_PER_PAGE 512
+/* D3D12's shader-visible CBV/SRV/UAV heap limit, not an emulator draw cap. */
+#define SHADPS4_DESCRIPTOR_PAGES (1000000 / SHADPS4_DESCRIPTORS_PER_PAGE)
 #define SHADPS4_MAX_WRITEBACKS 256
 #define SHADPS4_MAX_TRANSIENTS 128
+#define SHADPS4_D3D12_FRAMES_IN_FLIGHT 3
+#define SHADPS4_DESCRIPTOR_PAGES_PER_FRAME \
+    (SHADPS4_DESCRIPTOR_PAGES / SHADPS4_D3D12_FRAMES_IN_FLIGHT)
 #define SHADPS4_D3D12_FENCE_TIMEOUT_MS 10000
 #define SHADPS4_SHADER_CS_SETTINGS 0x212
 #define SHADPS4_SHADER_CS_USER_DATA 0x240
@@ -124,6 +129,17 @@ typedef struct ShadPS4D3D12Writeback {
     bool is_image;
 } ShadPS4D3D12Writeback;
 
+typedef struct ShadPS4D3D12Frame {
+    ID3D12CommandAllocator *allocator;
+    ID3D12GraphicsCommandList *list;
+    CPUState *writeback_cpu;
+    ShadPS4D3D12Writeback writebacks[SHADPS4_MAX_WRITEBACKS];
+    ID3D12Resource *transients[SHADPS4_MAX_TRANSIENTS];
+    uint64_t fence_value;
+    uint32_t writeback_count;
+    uint32_t transient_count;
+} ShadPS4D3D12Frame;
+
 typedef struct ShadPS4D3D12Pipeline {
     uint64_t key;
     uint64_t last_use;
@@ -168,6 +184,9 @@ struct ShadPS4D3D12State {
     ID3D12CommandQueue *queue;
     ID3D12CommandAllocator *allocator;
     ID3D12GraphicsCommandList *list;
+    ShadPS4D3D12Frame frames[SHADPS4_D3D12_FRAMES_IN_FLIGHT];
+    uint32_t frame_index;
+    uint32_t next_frame;
     ID3D12Fence *fence;
     HANDLE shared_fence_handle;
     LUID adapter_luid;
@@ -203,10 +222,11 @@ struct ShadPS4D3D12State {
     uint64_t pipeline_cache_clock;
     uint64_t surface_clock;
     uint32_t descriptor_page;
+    uint32_t descriptor_page_limit;
     CPUState *writeback_cpu;
-    ShadPS4D3D12Writeback writebacks[SHADPS4_MAX_WRITEBACKS];
+    ShadPS4D3D12Writeback *writebacks;
     uint32_t writeback_count;
-    ID3D12Resource *transients[SHADPS4_MAX_TRANSIENTS];
+    ID3D12Resource **transients;
     uint32_t transient_count;
     uint64_t reported_opcodes[4];
     uint32_t reported_no_draw_dwords[4];
@@ -216,6 +236,32 @@ struct ShadPS4D3D12State {
     bool traced_first_shader;
     bool ready;
 };
+
+static void shadps4_d3d12_store_frame(ShadPS4D3D12State *d3d12)
+{
+    ShadPS4D3D12Frame *frame = &d3d12->frames[d3d12->frame_index];
+
+    frame->writeback_cpu = d3d12->writeback_cpu;
+    frame->writeback_count = d3d12->writeback_count;
+    frame->transient_count = d3d12->transient_count;
+}
+
+static void shadps4_d3d12_select_frame(ShadPS4D3D12State *d3d12,
+                                       uint32_t frame_index)
+{
+    ShadPS4D3D12Frame *frame;
+
+    shadps4_d3d12_store_frame(d3d12);
+    d3d12->frame_index = frame_index;
+    frame = &d3d12->frames[frame_index];
+    d3d12->allocator = frame->allocator;
+    d3d12->list = frame->list;
+    d3d12->writeback_cpu = frame->writeback_cpu;
+    d3d12->writebacks = frame->writebacks;
+    d3d12->writeback_count = frame->writeback_count;
+    d3d12->transients = frame->transients;
+    d3d12->transient_count = frame->transient_count;
+}
 
 static bool shadps4_d3d12_is_tail_padding(const uint32_t *commands,
                                           uint32_t offset,
@@ -1111,20 +1157,107 @@ static bool shadps4_d3d12_is_sync_opcode(uint32_t opcode)
     }
 }
 
-static void shadps4_d3d12_record_sync(ShadPS4D3D12State *d3d12)
+static bool shadps4_d3d12_sync_surface(ShadPS4D3D12State *d3d12,
+                                      uint64_t guest_address)
 {
+    for (uint32_t i = 0; i < SHADPS4_D3D12_MAX_SURFACES; i++) {
+        ShadPS4D3D12Surface *surface = &d3d12->surfaces[i];
+        uint64_t size;
+
+        if (!surface->texture || !surface->guest_address) {
+            continue;
+        }
+        size = (uint64_t)surface->pitch * surface->height * 4;
+        if (guest_address >= surface->guest_address &&
+            guest_address - surface->guest_address < size) {
+            shadps4_d3d12_transition_surface(
+                d3d12, surface, D3D12_RESOURCE_STATE_COMMON);
+            return true;
+        }
+    }
+    for (uint32_t i = 0; i < SHADPS4_D3D12_MAX_DEPTH_SURFACES; i++) {
+        ShadPS4D3D12DepthSurface *surface = &d3d12->depth_surfaces[i];
+
+        if (surface->texture && surface->guest_address == guest_address) {
+            shadps4_d3d12_transition_depth_surface(
+                d3d12, surface, D3D12_RESOURCE_STATE_COMMON);
+            return true;
+        }
+    }
+    return false;
+}
+
+static void shadps4_d3d12_record_sync(ShadPS4D3D12State *d3d12,
+                                      uint32_t opcode,
+                                      const uint32_t *payload,
+                                      uint32_t payload_count)
+{
+    uint64_t address = 0;
     D3D12_RESOURCE_BARRIER barrier = {
         .Type = D3D12_RESOURCE_BARRIER_TYPE_UAV,
         .UAV = { .pResource = NULL },
     };
 
-    ID3D12GraphicsCommandList_ResourceBarrier(d3d12->list, 1, &barrier);
+    switch (opcode) {
+    case SHADPS4_PM4_PFP_SYNC_ME:
+        return;
+    case SHADPS4_PM4_SURFACE_SYNC:
+        if (payload_count >= 3) {
+            address = (uint64_t)le32_to_cpu(payload[2]) << 8;
+        }
+        break;
+    case SHADPS4_PM4_ACQUIRE_MEM:
+        if (payload_count >= 5) {
+            address = le32_to_cpu(payload[3]) |
+                ((uint64_t)le32_to_cpu(payload[4]) << 32);
+        }
+        break;
+    case SHADPS4_PM4_WAIT_REG_MEM:
+    case SHADPS4_PM4_EVENT_WRITE_EOP:
+    case SHADPS4_PM4_RELEASE_MEM:
+        if (payload_count >= 3) {
+            address = (le32_to_cpu(payload[1]) & ~UINT64_C(3)) |
+                ((uint64_t)le32_to_cpu(payload[2]) << 32);
+        }
+        break;
+    default:
+        break;
+    }
+    if (!address || !shadps4_d3d12_sync_surface(d3d12, address)) {
+        ID3D12GraphicsCommandList_ResourceBarrier(d3d12->list, 1, &barrier);
+    }
 }
 
 static void shadps4_d3d12_report(const char *operation, HRESULT hr)
 {
     warn_report("shadPS4 D3D12: %s failed: HRESULT=%#lx",
                 operation, (unsigned long)hr);
+}
+
+static bool shadps4_d3d12_ensure_sampler_heap(
+    ShadPS4D3D12State *d3d12, uint32_t descriptor_page)
+{
+    D3D12_DESCRIPTOR_HEAP_DESC desc = {
+        .Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+        .NumDescriptors = 256,
+        .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+    };
+    HRESULT hr;
+
+    if (descriptor_page >= SHADPS4_DESCRIPTOR_PAGES) {
+        return false;
+    }
+    if (d3d12->sampler_heaps[descriptor_page]) {
+        return true;
+    }
+    hr = ID3D12Device_CreateDescriptorHeap(
+        d3d12->device, &desc, &IID_ID3D12DescriptorHeap,
+        (void **)&d3d12->sampler_heaps[descriptor_page]);
+    if (FAILED(hr)) {
+        shadps4_d3d12_report("Create sampler descriptor heap", hr);
+        return false;
+    }
+    return true;
 }
 
 typedef HRESULT (WINAPI *ShadPS4D3D12GetDebugInterface)(REFIID, void **);
@@ -1276,7 +1409,7 @@ static bool shadps4_d3d12_create_constant_upload(ShadPS4D3D12State *d3d12)
     };
     D3D12_RESOURCE_DESC desc = {
         .Dimension = D3D12_RESOURCE_DIMENSION_BUFFER,
-        .Width = 512 * SHADPS4_DESCRIPTOR_PAGES,
+        .Width = SHADPS4_DESCRIPTORS_PER_PAGE * SHADPS4_DESCRIPTOR_PAGES,
         .Height = 1,
         .DepthOrArraySize = 1,
         .MipLevels = 1,
@@ -1299,7 +1432,8 @@ static bool shadps4_d3d12_create_constant_upload(ShadPS4D3D12State *d3d12)
         shadps4_d3d12_report("Map constant upload buffer", hr);
         return false;
     }
-    memset(d3d12->constant_map, 0, 512 * SHADPS4_DESCRIPTOR_PAGES);
+    memset(d3d12->constant_map, 0,
+           SHADPS4_DESCRIPTORS_PER_PAGE * SHADPS4_DESCRIPTOR_PAGES);
     return true;
 }
 
@@ -2885,6 +3019,9 @@ static bool shadps4_d3d12_record_draw(ShadPS4D3D12State *d3d12,
     uint32_t first_instance = 0;
     int32_t base_vertex = 0;
     uint32_t descriptor_page;
+    uint64_t multi_args = 0;
+    uint32_t multi_count = 1;
+    uint32_t multi_stride = 0;
     bool indexed = false;
     int depth_target;
     uint32_t target_width;
@@ -2928,12 +3065,13 @@ static bool shadps4_d3d12_record_draw(ShadPS4D3D12State *d3d12,
             &d3d12->depth_surfaces[depth_target],
             D3D12_RESOURCE_STATE_DEPTH_WRITE);
     }
-    if (d3d12->descriptor_page >= SHADPS4_DESCRIPTOR_PAGES) {
+    if (d3d12->descriptor_page >= d3d12->descriptor_page_limit) {
         *failure_reason = "descriptor pages exhausted";
         return false;
     }
     descriptor_page = d3d12->descriptor_page++;
-    if (!shadps4_d3d12_prepare_shader_resources(
+    if (!shadps4_d3d12_ensure_sampler_heap(d3d12, descriptor_page) ||
+        !shadps4_d3d12_prepare_shader_resources(
             d3d12, cs, vs, descriptor_page) ||
         (hs && !shadps4_d3d12_prepare_shader_resources(
             d3d12, cs, hs, descriptor_page)) ||
@@ -3008,6 +3146,57 @@ static bool shadps4_d3d12_record_draw(ShadPS4D3D12State *d3d12,
         indexed = true;
         break;
     }
+    case SHADPS4_PM4_DRAW_INDEX_INDIRECT_MULTI:
+    case SHADPS4_PM4_DRAW_INDEX_INDIRECT_COUNT_MULTI: {
+        uint32_t args[5];
+        uint64_t count_address = 0;
+
+        if (!indirect_base ||
+            (opcode == SHADPS4_PM4_DRAW_INDEX_INDIRECT_MULTI &&
+             payload_count < 6) ||
+            (opcode == SHADPS4_PM4_DRAW_INDEX_INDIRECT_COUNT_MULTI &&
+             payload_count < 9)) {
+            *failure_reason = "truncated indexed multi-draw packet";
+            return false;
+        }
+        multi_args = indirect_base + le32_to_cpu(payload[0]);
+        multi_count = le32_to_cpu(payload[
+            opcode == SHADPS4_PM4_DRAW_INDEX_INDIRECT_MULTI ? 3 : 4]);
+        multi_stride = le32_to_cpu(payload[
+            opcode == SHADPS4_PM4_DRAW_INDEX_INDIRECT_MULTI ? 4 : 7]);
+        if (multi_stride < sizeof(args) || multi_count > UINT16_MAX) {
+            *failure_reason = "invalid indexed multi-draw count or stride";
+            return false;
+        }
+        if (opcode == SHADPS4_PM4_DRAW_INDEX_INDIRECT_COUNT_MULTI) {
+            uint32_t gpu_count;
+
+            count_address = le32_to_cpu(payload[5]) |
+                ((uint64_t)le32_to_cpu(payload[6]) << 32);
+            if (!count_address || cpu_memory_rw_debug(
+                    cs, count_address, &gpu_count, sizeof(gpu_count),
+                    false) != 0) {
+                *failure_reason = "invalid indexed multi-draw count address";
+                return false;
+            }
+            multi_count = MIN(multi_count, le32_to_cpu(gpu_count));
+        }
+        if (!multi_count) {
+            return true;
+        }
+        if (cpu_memory_rw_debug(cs, multi_args, args,
+                                sizeof(args), false) != 0) {
+            *failure_reason = "invalid indexed multi-draw arguments";
+            return false;
+        }
+        vertex_count = le32_to_cpu(args[0]);
+        num_instances = le32_to_cpu(args[1]);
+        first_index = le32_to_cpu(args[2]);
+        base_vertex = le32_to_cpu(args[3]);
+        first_instance = le32_to_cpu(args[4]);
+        indexed = true;
+        break;
+    }
     default:
         *failure_reason = "unsupported draw packet";
         return false;
@@ -3020,7 +3209,7 @@ static bool shadps4_d3d12_record_draw(ShadPS4D3D12State *d3d12,
         *failure_reason = "vertex buffer upload failed";
         return false;
     }
-    if (indexed && !shadps4_d3d12_upload_index_buffer(
+    if (indexed && !multi_args && !shadps4_d3d12_upload_index_buffer(
             d3d12, cs, index_base, vertex_count + first_index,
             index_type, &index_view)) {
         *failure_reason = "index buffer upload failed";
@@ -3168,7 +3357,37 @@ static bool shadps4_d3d12_record_draw(ShadPS4D3D12State *d3d12,
                         resource->levels, resource->flags, readable, nonzero);
         }
     }
-    if (indexed) {
+    if (multi_args) {
+        for (uint32_t draw = 0; draw < multi_count; draw++) {
+            uint32_t args[5];
+
+            if (cpu_memory_rw_debug(cs, multi_args +
+                                    (uint64_t)draw * multi_stride,
+                                    args, sizeof(args), false) != 0) {
+                *failure_reason = "indexed multi-draw argument read failed";
+                return false;
+            }
+            vertex_count = le32_to_cpu(args[0]);
+            num_instances = MAX(le32_to_cpu(args[1]), 1);
+            first_index = le32_to_cpu(args[2]);
+            base_vertex = le32_to_cpu(args[3]);
+            first_instance = le32_to_cpu(args[4]);
+            if (!vertex_count) {
+                continue;
+            }
+            if (!shadps4_d3d12_upload_index_buffer(
+                    d3d12, cs, index_base, vertex_count + first_index,
+                    index_type, &index_view)) {
+                *failure_reason = "multi-draw index buffer upload failed";
+                return false;
+            }
+            ID3D12GraphicsCommandList_IASetIndexBuffer(
+                d3d12->list, &index_view);
+            ID3D12GraphicsCommandList_DrawIndexedInstanced(
+                d3d12->list, vertex_count, num_instances, first_index,
+                base_vertex, first_instance);
+        }
+    } else if (indexed) {
         ID3D12GraphicsCommandList_IASetIndexBuffer(d3d12->list, &index_view);
         ID3D12GraphicsCommandList_DrawIndexedInstanced(
             d3d12->list, vertex_count, num_instances, first_index,
@@ -3217,11 +3436,12 @@ static bool shadps4_d3d12_record_dispatch(ShadPS4D3D12State *d3d12,
     if (!cs || payload_count < 2) {
         return false;
     }
-    if (d3d12->descriptor_page >= SHADPS4_DESCRIPTOR_PAGES) {
+    if (d3d12->descriptor_page >= d3d12->descriptor_page_limit) {
         return false;
     }
     descriptor_page = d3d12->descriptor_page++;
-    if (!shadps4_d3d12_prepare_shader_resources(
+    if (!shadps4_d3d12_ensure_sampler_heap(d3d12, descriptor_page) ||
+        !shadps4_d3d12_prepare_shader_resources(
             d3d12, cpu, cs, descriptor_page)) {
         return false;
     }
@@ -3262,10 +3482,16 @@ static bool shadps4_d3d12_record_dispatch(ShadPS4D3D12State *d3d12,
 
 static void shadps4_d3d12_release(ShadPS4D3D12State *d3d12)
 {
-    for (uint32_t i = 0; i < d3d12->transient_count; i++) {
-        ID3D12Resource_Release(d3d12->transients[i]);
+    shadps4_d3d12_store_frame(d3d12);
+    for (uint32_t frame_index = 0;
+         frame_index < SHADPS4_D3D12_FRAMES_IN_FLIGHT; frame_index++) {
+        ShadPS4D3D12Frame *frame = &d3d12->frames[frame_index];
+
+        for (uint32_t i = 0; i < frame->transient_count; i++) {
+            ID3D12Resource_Release(frame->transients[i]);
+        }
+        frame->transient_count = 0;
     }
-    d3d12->transient_count = 0;
     for (uint32_t i = 0; i < SHADPS4_SHADER_CACHE_SIZE; i++) {
         shadps4_d3d12_shader_clear(&d3d12->shaders[i]);
     }
@@ -3338,14 +3564,18 @@ static void shadps4_d3d12_release(ShadPS4D3D12State *d3d12)
         ID3D12Fence_Release(d3d12->fence);
         d3d12->fence = NULL;
     }
-    if (d3d12->list) {
-        ID3D12GraphicsCommandList_Release(d3d12->list);
-        d3d12->list = NULL;
+    for (uint32_t i = 0; i < SHADPS4_D3D12_FRAMES_IN_FLIGHT; i++) {
+        if (d3d12->frames[i].list) {
+            ID3D12GraphicsCommandList_Release(d3d12->frames[i].list);
+            d3d12->frames[i].list = NULL;
+        }
+        if (d3d12->frames[i].allocator) {
+            ID3D12CommandAllocator_Release(d3d12->frames[i].allocator);
+            d3d12->frames[i].allocator = NULL;
+        }
     }
-    if (d3d12->allocator) {
-        ID3D12CommandAllocator_Release(d3d12->allocator);
-        d3d12->allocator = NULL;
-    }
+    d3d12->list = NULL;
+    d3d12->allocator = NULL;
     if (d3d12->queue) {
         ID3D12CommandQueue_Release(d3d12->queue);
         d3d12->queue = NULL;
@@ -3381,11 +3611,6 @@ ShadPS4D3D12State *shadps4_d3d12_create(void)
         .Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
         .NumDescriptors = SHADPS4_D3D12_MAX_DEPTH_SURFACES,
     };
-    D3D12_DESCRIPTOR_HEAP_DESC sampler_heap_desc = {
-        .Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
-        .NumDescriptors = 256,
-        .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-    };
     HRESULT hr;
     uint64_t dxil_version;
     uint64_t gcn_version;
@@ -3411,26 +3636,36 @@ ShadPS4D3D12State *shadps4_d3d12_create(void)
         shadps4_d3d12_report("CreateCommandQueue", hr);
         goto fail;
     }
-    hr = ID3D12Device_CreateCommandAllocator(
-        d3d12->device, D3D12_COMMAND_LIST_TYPE_DIRECT,
-        &IID_ID3D12CommandAllocator, (void **)&d3d12->allocator);
-    if (FAILED(hr)) {
-        shadps4_d3d12_report("CreateCommandAllocator", hr);
-        goto fail;
+    for (uint32_t i = 0; i < SHADPS4_D3D12_FRAMES_IN_FLIGHT; i++) {
+        ShadPS4D3D12Frame *frame = &d3d12->frames[i];
+
+        hr = ID3D12Device_CreateCommandAllocator(
+            d3d12->device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            &IID_ID3D12CommandAllocator, (void **)&frame->allocator);
+        if (FAILED(hr)) {
+            shadps4_d3d12_report("Create frame command allocator", hr);
+            goto fail;
+        }
+        hr = ID3D12Device_CreateCommandList(
+            d3d12->device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            frame->allocator, NULL, &IID_ID3D12GraphicsCommandList,
+            (void **)&frame->list);
+        if (FAILED(hr)) {
+            shadps4_d3d12_report("Create frame command list", hr);
+            goto fail;
+        }
+        hr = ID3D12GraphicsCommandList_Close(frame->list);
+        if (FAILED(hr)) {
+            shadps4_d3d12_report("Close initial frame command list", hr);
+            goto fail;
+        }
     }
-    hr = ID3D12Device_CreateCommandList(
-        d3d12->device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-        d3d12->allocator, NULL, &IID_ID3D12GraphicsCommandList,
-        (void **)&d3d12->list);
-    if (FAILED(hr)) {
-        shadps4_d3d12_report("CreateCommandList", hr);
-        goto fail;
-    }
-    hr = ID3D12GraphicsCommandList_Close(d3d12->list);
-    if (FAILED(hr)) {
-        shadps4_d3d12_report("Close initial command list", hr);
-        goto fail;
-    }
+    d3d12->frame_index = 0;
+    d3d12->next_frame = 0;
+    d3d12->allocator = d3d12->frames[0].allocator;
+    d3d12->list = d3d12->frames[0].list;
+    d3d12->writebacks = d3d12->frames[0].writebacks;
+    d3d12->transients = d3d12->frames[0].transients;
     hr = ID3D12Device_CreateFence(d3d12->device, 0,
                                   D3D12_FENCE_FLAG_SHARED,
                                   &IID_ID3D12Fence,
@@ -3470,15 +3705,6 @@ ShadPS4D3D12State *shadps4_d3d12_create(void)
     if (FAILED(hr)) {
         shadps4_d3d12_report("Create resource descriptor heap", hr);
         goto fail;
-    }
-    for (uint32_t i = 0; i < SHADPS4_DESCRIPTOR_PAGES; i++) {
-        hr = ID3D12Device_CreateDescriptorHeap(
-            d3d12->device, &sampler_heap_desc, &IID_ID3D12DescriptorHeap,
-            (void **)&d3d12->sampler_heaps[i]);
-        if (FAILED(hr)) {
-            shadps4_d3d12_report("Create sampler descriptor heap", hr);
-            goto fail;
-        }
     }
     d3d12->resource_stride = ID3D12Device_GetDescriptorHandleIncrementSize(
         d3d12->device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -3688,6 +3914,49 @@ static bool shadps4_d3d12_complete_writebacks(ShadPS4D3D12State *d3d12)
     return ok;
 }
 
+static bool shadps4_d3d12_wait_frame(ShadPS4D3D12State *d3d12,
+                                     uint32_t frame_index)
+{
+    ShadPS4D3D12Frame *frame;
+    HRESULT hr;
+    DWORD wait_result;
+    bool ok = true;
+
+    shadps4_d3d12_select_frame(d3d12, frame_index);
+    frame = &d3d12->frames[frame_index];
+    if (frame->fence_value &&
+        ID3D12Fence_GetCompletedValue(d3d12->fence) < frame->fence_value) {
+        hr = ID3D12Fence_SetEventOnCompletion(
+            d3d12->fence, frame->fence_value, d3d12->fence_event);
+        if (FAILED(hr)) {
+            shadps4_d3d12_report("Set frame completion event", hr);
+            return false;
+        }
+        wait_result = WaitForSingleObjectEx(
+            d3d12->fence_event, SHADPS4_D3D12_FENCE_TIMEOUT_MS, FALSE);
+        if (wait_result != WAIT_OBJECT_0) {
+            warn_report("shadPS4 D3D12: frame %u fence wait failed: "
+                        "result=%lu requested=%" PRIu64 " completed=%" PRIu64,
+                        frame_index, wait_result, frame->fence_value,
+                        ID3D12Fence_GetCompletedValue(d3d12->fence));
+            return false;
+        }
+    }
+    if (frame->fence_value) {
+        ok = shadps4_d3d12_complete_writebacks(d3d12);
+    } else {
+        d3d12->writeback_count = 0;
+        d3d12->writeback_cpu = NULL;
+    }
+    for (uint32_t i = 0; i < d3d12->transient_count; i++) {
+        ID3D12Resource_Release(d3d12->transients[i]);
+    }
+    d3d12->transient_count = 0;
+    frame->fence_value = 0;
+    shadps4_d3d12_store_frame(d3d12);
+    return ok;
+}
+
 bool shadps4_d3d12_submit(ShadPS4D3D12State *d3d12,
                           CPUState *cs,
                           const uint32_t *commands,
@@ -3718,13 +3987,14 @@ bool shadps4_d3d12_submit(ShadPS4D3D12State *d3d12,
         shader_register_count > ARRAY_SIZE(current_shader)) {
         return false;
     }
-    if (!shadps4_d3d12_finish(d3d12)) {
+    uint32_t frame_index = d3d12->next_frame;
+
+    d3d12->next_frame = (frame_index + 1) %
+                        SHADPS4_D3D12_FRAMES_IN_FLIGHT;
+    if (!shadps4_d3d12_wait_frame(d3d12, frame_index)) {
+        d3d12->ready = false;
         return false;
     }
-    for (uint32_t i = 0; i < d3d12->transient_count; i++) {
-        ID3D12Resource_Release(d3d12->transients[i]);
-    }
-    d3d12->transient_count = 0;
     hr = ID3D12CommandAllocator_Reset(d3d12->allocator);
     if (FAILED(hr)) {
         shadps4_d3d12_report("Reset command allocator", hr);
@@ -3736,7 +4006,10 @@ bool shadps4_d3d12_submit(ShadPS4D3D12State *d3d12,
         shadps4_d3d12_report("Reset command list", hr);
         return false;
     }
-    d3d12->descriptor_page = 0;
+    d3d12->descriptor_page = frame_index *
+                             SHADPS4_DESCRIPTOR_PAGES_PER_FRAME;
+    d3d12->descriptor_page_limit = d3d12->descriptor_page +
+                                   SHADPS4_DESCRIPTOR_PAGES_PER_FRAME;
     d3d12->writeback_count = 0;
     d3d12->writeback_cpu = cs;
     memcpy(current_context, context_registers,
@@ -3986,7 +4259,8 @@ bool shadps4_d3d12_submit(ShadPS4D3D12State *d3d12,
                     shadps4_d3d12_report_opcode_once(d3d12, opcode);
                 }
             } else if (shadps4_d3d12_is_sync_opcode(opcode)) {
-                shadps4_d3d12_record_sync(d3d12);
+                shadps4_d3d12_record_sync(
+                    d3d12, opcode, &commands[offset + 1], payload_count);
             }
         } else {
             goto fail_recording;
@@ -4012,6 +4286,16 @@ bool shadps4_d3d12_submit(ShadPS4D3D12State *d3d12,
     }
     lists[0] = (ID3D12CommandList *)d3d12->list;
     ID3D12CommandQueue_ExecuteCommandLists(d3d12->queue, 1, lists);
+    d3d12->fence_value++;
+    hr = ID3D12CommandQueue_Signal(d3d12->queue, d3d12->fence,
+                                   d3d12->fence_value);
+    if (FAILED(hr)) {
+        shadps4_d3d12_report("Signal submitted frame", hr);
+        d3d12->ready = false;
+        return false;
+    }
+    d3d12->frames[frame_index].fence_value = d3d12->fence_value;
+    shadps4_d3d12_store_frame(d3d12);
     d3d12->submit_count++;
     d3d12->draw_count += draws;
     d3d12->dispatch_count += dispatches;
@@ -4060,11 +4344,13 @@ fail_recording:
 bool shadps4_d3d12_finish(ShadPS4D3D12State *d3d12)
 {
     HRESULT hr;
-    DWORD wait_result;
+    uint32_t active_frame;
 
     if (!d3d12 || !d3d12->ready) {
         return false;
     }
+    active_frame = d3d12->frame_index;
+    shadps4_d3d12_store_frame(d3d12);
     d3d12->fence_value++;
     hr = ID3D12CommandQueue_Signal(d3d12->queue, d3d12->fence,
                                    d3d12->fence_value);
@@ -4073,33 +4359,20 @@ bool shadps4_d3d12_finish(ShadPS4D3D12State *d3d12)
         d3d12->ready = false;
         return false;
     }
-    if (ID3D12Fence_GetCompletedValue(d3d12->fence) >=
-        d3d12->fence_value) {
-        return shadps4_d3d12_complete_writebacks(d3d12);
-    }
-    hr = ID3D12Fence_SetEventOnCompletion(d3d12->fence,
-                                          d3d12->fence_value,
-                                          d3d12->fence_event);
-    if (FAILED(hr)) {
-        shadps4_d3d12_report("SetEventOnCompletion", hr);
-        d3d12->ready = false;
-        return false;
-    }
-    wait_result = WaitForSingleObjectEx(
-        d3d12->fence_event, SHADPS4_D3D12_FENCE_TIMEOUT_MS, FALSE);
-    if (wait_result != WAIT_OBJECT_0) {
-        HRESULT removed = ID3D12Device_GetDeviceRemovedReason(d3d12->device);
+    d3d12->frames[active_frame].fence_value = d3d12->fence_value;
+    for (uint32_t i = 0; i < SHADPS4_D3D12_FRAMES_IN_FLIGHT; i++) {
+        if (!shadps4_d3d12_wait_frame(d3d12, i)) {
+            HRESULT removed = ID3D12Device_GetDeviceRemovedReason(
+                d3d12->device);
 
-        warn_report("shadPS4 D3D12: fence wait failed: result=%lu error=%lu"
-                    " requested=%" PRIu64 " completed=%" PRIu64
-                    " device=%#lx; renderer disabled",
-                    wait_result, GetLastError(), d3d12->fence_value,
-                    ID3D12Fence_GetCompletedValue(d3d12->fence),
-                    (unsigned long)removed);
-        d3d12->ready = false;
-        return false;
+            warn_report("shadPS4 D3D12: finish failed for frame=%u "
+                        "device=%#lx; renderer disabled", i,
+                        (unsigned long)removed);
+            d3d12->ready = false;
+            return false;
+        }
     }
-    return shadps4_d3d12_complete_writebacks(d3d12);
+    return true;
 }
 
 bool shadps4_d3d12_is_ready(const ShadPS4D3D12State *d3d12)
@@ -4288,6 +4561,7 @@ bool shadps4_d3d12_publish_surface(ShadPS4D3D12State *d3d12,
         shadps4_d3d12_report("Signal shared VideoOut surface", hr);
         return false;
     }
+    d3d12->frames[d3d12->frame_index].fence_value = d3d12->fence_value;
     frame = (QemuHostD3D12VideoFrame) {
         .size = sizeof(frame),
         .version = QEMU_HOST_D3D12_VIDEO_FRAME_VERSION,

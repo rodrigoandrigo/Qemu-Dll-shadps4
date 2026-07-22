@@ -684,12 +684,6 @@ static bool shadps4_gpu_submit_commands(ShadPS4GPUState *gpu, CPUState *cs,
         warn_report("shadPS4 D3D12: command submission failed; using CPU "
                     "scanout fallback");
     }
-    if (gpu->d3d12 && shadps4_d3d12_is_ready(gpu->d3d12) &&
-        !shadps4_d3d12_finish(gpu->d3d12)) {
-        shadps4_gpu_report_reject(gpu, "d3d12-finish", guest_address,
-                                  command_dwords, NULL);
-        return false;
-    }
 #endif
     memset(&error, 0, sizeof(error));
     if (!shadps4_gpu_execute_pm4_memory(

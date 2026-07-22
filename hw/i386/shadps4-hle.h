@@ -12,6 +12,7 @@
 #include "hw/i386/shadps4-io.h"
 #include "hw/i386/shadps4-loader.h"
 #include "qapi/error.h"
+#include "qemu/timer.h"
 #include "system/memory.h"
 
 #define SHADPS4_HLE_MAX_MMAP_SLOTS 3072
@@ -27,6 +28,9 @@
     (SHADPS4_HLE_MAX_SERVICE_OBJECTS * SHADPS4_HLE_SERVICE_GUEST_STRIDE)
 #define SHADPS4_HLE_MAX_NETCTL_CALLBACKS 8
 #define SHADPS4_HLE_MAX_PTHREAD_KEYS 64
+#define SHADPS4_HLE_MAIN_THREAD_SLOT SHADPS4_HLE_MAX_SERVICE_OBJECTS
+#define SHADPS4_HLE_WAIT_SLOTS (SHADPS4_HLE_MAX_SERVICE_OBJECTS + 1)
+#define SHADPS4_HLE_WAITER_WORDS DIV_ROUND_UP(SHADPS4_HLE_WAIT_SLOTS, 64)
 #define SHADPS4_HLE_MAX_AIO_REQUESTS 512
 #define SHADPS4_HLE_MAX_SYSMODULE_ID 313
 #define SHADPS4_HLE_MAX_SERVICE_EVENTS 16
@@ -527,8 +531,11 @@ typedef enum ShadPS4HLEFunction {
     SHADPS4_HLE_PTHREAD_CANCEL_STATE,
     SHADPS4_HLE_PTHREAD_SCHED_PRIORITY,
     SHADPS4_HLE_PTHREAD_SET_SCHEDPARAM,
+    SHADPS4_HLE_PTHREAD_SET_PRIORITY,
     SHADPS4_HLE_PTHREAD_GET_AFFINITY,
+    SHADPS4_HLE_PTHREAD_GET_AFFINITY_MASK,
     SHADPS4_HLE_PTHREAD_SET_AFFINITY,
+    SHADPS4_HLE_PTHREAD_SET_AFFINITY_MASK,
     SHADPS4_HLE_PTHREAD_GET_TID,
     SHADPS4_HLE_PTHREAD_EXIT,
     SHADPS4_HLE_PTHREAD_SET_NAME,
@@ -1208,7 +1215,30 @@ typedef enum ShadPS4HLEFunction {
     SHADPS4_HLE_SSL_GET_CA_CERTS,
     SHADPS4_HLE_SSL_FREE_CA_CERTS,
     SHADPS4_HLE_VIDEO_RECORDING_SET_INFO,
+    SHADPS4_HLE_PTHREAD_BARRIER_INIT,
+    SHADPS4_HLE_PTHREAD_BARRIER_WAIT,
+    SHADPS4_HLE_PTHREAD_BARRIER_DESTROY,
+    SHADPS4_HLE_JIT_MAP_SHARED_MEMORY,
+    SHADPS4_HLE_JIT_CREATE_SHARED_MEMORY,
+    SHADPS4_HLE_JIT_CREATE_ALIAS,
+    SHADPS4_HLE_COREDUMP_ATTACH_MEMORY,
+    SHADPS4_HLE_COREDUMP_ATTACH_FILE,
+    SHADPS4_HLE_COREDUMP_DEBUG_TEXT,
+    SHADPS4_HLE_COREDUMP_WRITE_USER_DATA,
+    SHADPS4_HLE_PS2_DIALOG_GET_RESULT,
+    SHADPS4_HLE_PS2_DIALOG_INITIALIZE,
+    SHADPS4_HLE_PS2_DIALOG_UPDATE_STATUS,
+    SHADPS4_HLE_PS2_DIALOG_TERMINATE,
+    SHADPS4_HLE_PS2_DIALOG_OPEN,
+    SHADPS4_HLE_VIDEO_RECORDING_CLOSE,
+    SHADPS4_HLE_VIDEO_RECORDING_STOP,
+    SHADPS4_HLE_VIDEO_RECORDING_GET_STATUS,
+    SHADPS4_HLE_VIDEO_RECORDING_START,
     SHADPS4_HLE_RESIDUAL_END,
+    SHADPS4_HLE_PS2_PROCESS_ADD,
+    SHADPS4_HLE_PS2_PROCESS_GET_PARENT_SOCKET,
+    SHADPS4_HLE_PS2_PROCESS_KILL,
+    SHADPS4_HLE_PS2_PROCESS_SHOW_MENU,
 } ShadPS4HLEFunction;
 
 typedef struct ShadPS4HLEVideoBuffer {
@@ -1224,6 +1254,7 @@ typedef struct ShadPS4HLEVideoBuffer {
 
 typedef struct ShadPS4HLEAudioPort {
     uint32_t frames;
+    uint32_t sample_rate;
     uint32_t channels;
     uint32_t sample_size;
     uint32_t format;
@@ -1273,6 +1304,24 @@ typedef struct ShadPS4HLECallHistory {
     char nid[12];
 } ShadPS4HLECallHistory;
 
+typedef enum ShadPS4HLEWaitKind {
+    SHADPS4_HLE_WAIT_NONE,
+    SHADPS4_HLE_WAIT_SLEEP,
+    SHADPS4_HLE_WAIT_MUTEX,
+    SHADPS4_HLE_WAIT_COND,
+    SHADPS4_HLE_WAIT_SEM,
+    SHADPS4_HLE_WAIT_KERNEL_SEMA,
+    SHADPS4_HLE_WAIT_JOIN,
+    SHADPS4_HLE_WAIT_BARRIER,
+    SHADPS4_HLE_WAIT_SOCKET_MSG,
+    SHADPS4_HLE_WAIT_SOCKET_RECV,
+} ShadPS4HLEWaitKind;
+
+typedef struct ShadPS4HLEWaitTimer {
+    void *hle;
+    uint32_t wait_slot;
+} ShadPS4HLEWaitTimer;
+
 typedef enum ShadPS4HLEFileType {
     SHADPS4_HLE_FD_FREE,
     SHADPS4_HLE_FD_CONSOLE,
@@ -1285,6 +1334,7 @@ typedef enum ShadPS4HLEFileType {
     SHADPS4_HLE_FD_STORAGE,
     SHADPS4_HLE_FD_DIALOG,
     SHADPS4_HLE_FD_NETWORK,
+    SHADPS4_HLE_FD_LOCAL_SOCKET,
 } ShadPS4HLEFileType;
 
 typedef struct ShadPS4HLEHeapAllocation {
@@ -1299,6 +1349,10 @@ typedef int (*ShadPS4HLEThreadStart)(void *opaque, uint64_t handle,
                                      uint64_t gs_base);
 typedef void (*ShadPS4HLEThreadExit)(void *opaque, CPUState *cs,
                                      uint64_t handle, uint64_t result);
+typedef bool (*ShadPS4HLEThreadWake)(void *opaque, uint32_t cpu_index,
+                                     uint64_t handle, uint64_t result);
+typedef bool (*ShadPS4HLEThreadKill)(void *opaque, uint64_t handle,
+                                     uint64_t result);
 
 typedef struct ShadPS4HLEState {
     AddressSpace *as;
@@ -1309,9 +1363,13 @@ typedef struct ShadPS4HLEState {
     uint32_t external_nid_count;
     ShadPS4HLEExternalNID external_nids[SHADPS4_HLE_MAX_EXTERNAL_NIDS];
     uint64_t result;
+    uint64_t cpu_results[8];
+    uint64_t thread_results[SHADPS4_HLE_MAX_SERVICE_OBJECTS];
     uint64_t dynamic_pd_phys;
     uint64_t dynamic_virt_base;
+    bool tlb_flush_all_requested;
     uint64_t dynamic_phys_base;
+    uint64_t virtual_reserve_cursor;
     uint32_t dynamic_slot_count;
     bool dynamic_slots[SHADPS4_HLE_MAX_MMAP_SLOTS];
     uint64_t direct_memory_next;
@@ -1322,12 +1380,16 @@ typedef struct ShadPS4HLEState {
     uint64_t heap_end;
     ShadPS4HLEHeapAllocation heap_allocs[SHADPS4_HLE_MAX_HEAP_ALLOCS];
     uint64_t libc_file_arena;
+    uint64_t libc_heap_trace_arena;
     bool libc_file_used[256];
     int32_t libc_file_fd[256];
     ShadPS4HLEFileType files[SHADPS4_HLE_MAX_FDS];
     uint8_t file_units[SHADPS4_HLE_MAX_FDS];
     int64_t storage_handles[SHADPS4_HLE_MAX_FDS];
     int64_t network_handles[SHADPS4_HLE_MAX_FDS];
+    int8_t local_socket_peers[SHADPS4_HLE_MAX_FDS];
+    GByteArray *local_socket_rx[SHADPS4_HLE_MAX_FDS];
+    GByteArray *local_socket_control[SHADPS4_HLE_MAX_FDS];
     bool storage_read_only[SHADPS4_HLE_MAX_FDS];
     char storage_paths[SHADPS4_HLE_MAX_FDS][192];
     bool equeues[SHADPS4_HLE_MAX_EQUEUES];
@@ -1338,6 +1400,9 @@ typedef struct ShadPS4HLEState {
     uint64_t tls_guest_addr[SHADPS4_HLE_MAX_TLS_MODULES];
     uint64_t tls_guest_size[SHADPS4_HLE_MAX_TLS_MODULES];
     uint32_t tls_module_count;
+    uint64_t tls_template_base;
+    uint64_t tls_template_tcb;
+    uint64_t tls_template_size;
     uint32_t compiled_sdk_version;
     int64_t rtc_tick_offset[4];
     uint64_t proc_param_guest_addr;
@@ -1355,8 +1420,21 @@ typedef struct ShadPS4HLEState {
     void *thread_opaque;
     ShadPS4HLEThreadStart thread_start;
     ShadPS4HLEThreadExit thread_exit;
+    ShadPS4HLEThreadWake thread_wake;
+    ShadPS4HLEThreadKill thread_kill;
     uint64_t cpu_thread_handles[8];
-    uint64_t cpu_wait_mutex[8];
+    uint32_t thread_process_ids[SHADPS4_HLE_MAX_SERVICE_OBJECTS];
+    uint64_t cpu_pending_wait_thread[8];
+    uint32_t wait_cpu[SHADPS4_HLE_WAIT_SLOTS];
+    uint64_t wait_threads[SHADPS4_HLE_WAIT_SLOTS];
+    uint64_t wait_mutex[SHADPS4_HLE_WAIT_SLOTS];
+    uint8_t wait_kind[SHADPS4_HLE_WAIT_SLOTS];
+    uint64_t wait_object[SHADPS4_HLE_WAIT_SLOTS];
+    uint64_t wait_value[SHADPS4_HLE_WAIT_SLOTS];
+    uint64_t wait_output[SHADPS4_HLE_WAIT_SLOTS];
+    uint64_t wait_timeout_result[SHADPS4_HLE_WAIT_SLOTS];
+    QEMUTimer *wait_timers[SHADPS4_HLE_WAIT_SLOTS];
+    ShadPS4HLEWaitTimer wait_timer_data[SHADPS4_HLE_WAIT_SLOTS];
     uint32_t hle_history_head;
     uint32_t hle_history_count;
     ShadPS4HLECallHistory hle_history[SHADPS4_HLE_HISTORY_SIZE];
@@ -1390,6 +1468,8 @@ typedef struct ShadPS4HLEState {
     uint64_t service_guest_addr[SHADPS4_HLE_MAX_SERVICE_OBJECTS];
     uint64_t service_value[SHADPS4_HLE_MAX_SERVICE_OBJECTS];
     uint64_t service_aux_value[SHADPS4_HLE_MAX_SERVICE_OBJECTS];
+    uint64_t service_waiters[SHADPS4_HLE_MAX_SERVICE_OBJECTS]
+                            [SHADPS4_HLE_WAITER_WORDS];
     uint64_t service_content_length[SHADPS4_HLE_MAX_SERVICE_OBJECTS];
     int64_t service_host_handles[SHADPS4_HLE_MAX_SERVICE_OBJECTS];
     bool service_active[SHADPS4_HLE_MAX_SERVICE_OBJECTS];
@@ -1402,7 +1482,8 @@ typedef struct ShadPS4HLEState {
         pthread_attrs[SHADPS4_HLE_MAX_SERVICE_OBJECTS];
     bool pthread_keys[SHADPS4_HLE_MAX_PTHREAD_KEYS];
     uint64_t pthread_key_destructors[SHADPS4_HLE_MAX_PTHREAD_KEYS];
-    uint64_t pthread_key_values[SHADPS4_HLE_MAX_PTHREAD_KEYS];
+    uint64_t pthread_key_values[SHADPS4_HLE_MAX_SERVICE_OBJECTS + 1]
+                               [SHADPS4_HLE_MAX_PTHREAD_KEYS];
     uint32_t aio_states[SHADPS4_HLE_MAX_AIO_REQUESTS];
     uint32_t aio_next_id;
     uint64_t signal_handlers[128];
@@ -1459,6 +1540,18 @@ typedef struct ShadPS4HLEState {
     bool audio_mastering_initialized;
     uint64_t coredump_handler;
     uint64_t coredump_common;
+    uint64_t coredump_attachment_count;
+    uint64_t coredump_user_data_size;
+    uint32_t ps2_dialog_status;
+    int32_t ps2_dialog_result;
+    bool video_recording_open;
+    bool video_recording_active;
+    uint64_t ps2_compiler_entry;
+    uint64_t ps2_compiler_proc_param;
+    uint64_t ps2_process_thread;
+    int32_t ps2_parent_socket;
+    int32_t ps2_process_id;
+    bool ps2_process_active;
     int32_t rtc_minuteswest;
     int32_t rtc_dsttime;
     int32_t webapi_last_error;
@@ -1480,8 +1573,10 @@ void shadps4_hle_init(ShadPS4HLEState *hle, AddressSpace *as,
                       const char *title_id,
                       uint64_t dynamic_pd_phys, uint64_t dynamic_virt_base);
 void shadps4_hle_set_thread_callbacks(ShadPS4HLEState *hle, void *opaque,
-                                      ShadPS4HLEThreadStart start,
-                                      ShadPS4HLEThreadExit exit);
+                                       ShadPS4HLEThreadStart start,
+                                       ShadPS4HLEThreadExit exit,
+                                       ShadPS4HLEThreadWake wake,
+                                       ShadPS4HLEThreadKill kill);
 bool shadps4_hle_reset(ShadPS4HLEState *hle, uint64_t dynamic_phys_base,
                        uint64_t physical_limit, Error **errp);
 void shadps4_hle_cleanup(ShadPS4HLEState *hle);
