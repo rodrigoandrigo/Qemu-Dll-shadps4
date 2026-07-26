@@ -16,6 +16,7 @@
 #include "system/memory.h"
 
 #define SHADPS4_HLE_MAX_MMAP_SLOTS 3072
+#define SHADPS4_HLE_MAX_PT_PAGES 4096
 #define SHADPS4_HLE_MAX_FDS 16
 #define SHADPS4_HLE_MAX_EQUEUES 16
 #define SHADPS4_HLE_MAX_EQUEUE_EVENTS 32
@@ -35,10 +36,14 @@
 #define SHADPS4_HLE_MAX_SYSMODULE_ID 313
 #define SHADPS4_HLE_MAX_SERVICE_EVENTS 16
 #define SHADPS4_HLE_MAX_HEAP_ALLOCS 8192
+#define SHADPS4_HLE_MAX_VIRTUAL_RESERVATIONS 1024
+#define SHADPS4_HLE_MAX_MISSING_APP_PATHS 64
 #define SHADPS4_HLE_FUNCTION_BASE 0x10000000U
 #define SHADPS4_HLE_EXTERNAL_BASE 0x40000000U
 #define SHADPS4_HLE_MAX_EXTERNAL_NIDS 4096
 #define SHADPS4_HLE_HISTORY_SIZE 128
+#define SHADPS4_HLE_INTERNAL_FAULT UINT64_MAX
+#define SHADPS4_HLE_INTERNAL_SIGNAL_RETURN (UINT64_MAX - 1)
 
 typedef enum ShadPS4HLEFunction {
     SHADPS4_HLE_TLS_GET_ADDR = SHADPS4_HLE_FUNCTION_BASE,
@@ -1146,6 +1151,7 @@ typedef enum ShadPS4HLEFunction {
     SHADPS4_HLE_VR_TRACKER_END,
     SHADPS4_HLE_RESIDUAL_BEGIN,
     SHADPS4_HLE_COMMON_DIALOG_IS_USED,
+    SHADPS4_HLE_COMPANION_UTIL_GET_EVENT,
     SHADPS4_HLE_COMPANION_GET_EVENT,
     SHADPS4_HLE_ERROR_DIALOG_CLOSE,
     SHADPS4_HLE_ERROR_DIALOG_GET_STATUS,
@@ -1327,6 +1333,7 @@ typedef enum ShadPS4HLEFileType {
     SHADPS4_HLE_FD_CONSOLE,
     SHADPS4_HLE_FD_NULL,
     SHADPS4_HLE_FD_ZERO,
+    SHADPS4_HLE_FD_RANDOM,
     SHADPS4_HLE_FD_GPU,
     SHADPS4_HLE_FD_PAD,
     SHADPS4_HLE_FD_AUDIO,
@@ -1342,6 +1349,15 @@ typedef struct ShadPS4HLEHeapAllocation {
     uint64_t size;
     bool active;
 } ShadPS4HLEHeapAllocation;
+
+/* A reservation is a VMA, not a 2 MiB mapping slot.  Keep its precise
+ * bounds so sceKernelVirtualQuery can report reservations that have no
+ * physical backing yet. */
+typedef struct ShadPS4HLEVirtualReservation {
+    uint64_t address;
+    uint64_t size;
+    bool active;
+} ShadPS4HLEVirtualReservation;
 
 typedef int (*ShadPS4HLEThreadStart)(void *opaque, uint64_t handle,
                                      uint64_t entry, uint64_t argument,
@@ -1372,6 +1388,10 @@ typedef struct ShadPS4HLEState {
     uint64_t virtual_reserve_cursor;
     uint32_t dynamic_slot_count;
     bool dynamic_slots[SHADPS4_HLE_MAX_MMAP_SLOTS];
+    bool dynamic_reserved_slots[SHADPS4_HLE_MAX_MMAP_SLOTS];
+    uint64_t dynamic_pt_phys_base;
+    uint32_t dynamic_pt_page_count;
+    bool dynamic_pt_used[SHADPS4_HLE_MAX_PT_PAGES];
     uint64_t direct_memory_next;
     uint64_t prt_aperture_address;
     uint64_t prt_aperture_size;
@@ -1379,6 +1399,8 @@ typedef struct ShadPS4HLEState {
     uint64_t heap_cursor;
     uint64_t heap_end;
     ShadPS4HLEHeapAllocation heap_allocs[SHADPS4_HLE_MAX_HEAP_ALLOCS];
+    ShadPS4HLEVirtualReservation
+        virtual_reservations[SHADPS4_HLE_MAX_VIRTUAL_RESERVATIONS];
     uint64_t libc_file_arena;
     uint64_t libc_heap_trace_arena;
     bool libc_file_used[256];
@@ -1392,6 +1414,8 @@ typedef struct ShadPS4HLEState {
     GByteArray *local_socket_control[SHADPS4_HLE_MAX_FDS];
     bool storage_read_only[SHADPS4_HLE_MAX_FDS];
     char storage_paths[SHADPS4_HLE_MAX_FDS][192];
+    char missing_app_paths[SHADPS4_HLE_MAX_MISSING_APP_PATHS][192];
+    uint32_t missing_app_path_next;
     bool equeues[SHADPS4_HLE_MAX_EQUEUES];
     uint64_t equeue_vblank_seen[SHADPS4_HLE_MAX_EQUEUES];
     ShadPS4HLEEqueueEvent
@@ -1424,6 +1448,7 @@ typedef struct ShadPS4HLEState {
     ShadPS4HLEThreadKill thread_kill;
     uint64_t cpu_thread_handles[8];
     uint32_t thread_process_ids[SHADPS4_HLE_MAX_SERVICE_OBJECTS];
+    uint64_t thread_stack_tops[SHADPS4_HLE_MAX_SERVICE_OBJECTS];
     uint64_t cpu_pending_wait_thread[8];
     uint32_t wait_cpu[SHADPS4_HLE_WAIT_SLOTS];
     uint64_t wait_threads[SHADPS4_HLE_WAIT_SLOTS];
@@ -1488,6 +1513,15 @@ typedef struct ShadPS4HLEState {
     uint32_t aio_next_id;
     uint64_t signal_handlers[128];
     uint64_t signal_mask[2];
+    uint64_t signal_contexts[SHADPS4_HLE_MAX_SERVICE_OBJECTS];
+    uint64_t signal_fault_rips[SHADPS4_HLE_MAX_SERVICE_OBJECTS];
+    uint64_t signal_resume_rips[SHADPS4_HLE_MAX_SERVICE_OBJECTS];
+    uint64_t signal_resume_rflags[SHADPS4_HLE_MAX_SERVICE_OBJECTS];
+    uint64_t signal_return_address;
+    uint64_t thread_return_address;
+    bool signal_delivery_requested;
+    bool signal_return_requested;
+    bool fatal_fault_requested;
     bool netctl_initialized;
     bool np_matching_initialized;
     bool np_signaling_initialized;

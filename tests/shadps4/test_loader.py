@@ -1752,7 +1752,7 @@ def run_test(dll_path):
             ("gnm-resource-stub", "+RaJBCVJZVM", "libSceGnmDriverResourceRegistration", b"", [bytes.fromhex("48 85 c0")]),
             ("vr-gpu-test-stub", "5ucmy8hcSPk", "libSceVrTrackerGpuTest", b"", [bytes.fromhex("48 85 c0")]),
             ("np-webapi2-stub", "2hlBNB96saE", "libSceNpWebApi2", b"", [bytes.fromhex("48 85 c0")]),
-            ("companion-util-stub", "cE5Msy11WhU", "libSceCompanionUtil", b"", [bytes.fromhex("3d 08 00 e4 80")]),
+            ("companion-util-stub", "cE5Msy11WhU", "libSceCompanionUtil", b"", [bytes.fromhex("3d 08 00 ad 80")]),
             ("vr-live-capture-stub", "3YCwwpHkHIg", "libSceVrTrackerLiveCapture", b"", [bytes.fromhex("48 85 c0")]),
             ("common-dialog-stub", "2RdicdHhtGA", "libSceCommonDialog", b"",
              [bytes.fromhex("48 85 c0")]),

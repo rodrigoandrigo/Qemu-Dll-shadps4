@@ -462,10 +462,18 @@ static uint64_t shadps4_hle_dispatch_services6(
     case SHADPS4_HLE_COMMON_DIALOG_IS_USED:
         return hle->dialog_status != 0 || hle->error_dialog_status != 0 ||
                hle->web_dialog_status != 0;
+    case SHADPS4_HLE_COMPANION_UTIL_GET_EVENT:
+        /*
+         * libSceCompanionUtil has no queued second-screen events in this
+         * host-only implementation.  This is a distinct ABI from
+         * libSceCompanionHttpd: the latter also fills its 260-byte event
+         * record before reporting that its queue is empty.
+         */
+        return UINT32_C(0x80ad0008);
     case SHADPS4_HLE_COMPANION_GET_EVENT:
         stl_le_p(data, UINT32_C(0x10000002));
         return shadps4_services6_rw(cs, a0, data, sizeof(data), true) ?
-               0 : -SHADPS4_GUEST_EFAULT;
+               UINT32_C(0x80e40008) : -SHADPS4_GUEST_EFAULT;
     case SHADPS4_HLE_ERROR_DIALOG_INIT:
         if (hle->error_dialog_status) return SHADPS4_COMMON_ALREADY_INITIALIZED;
         hle->error_dialog_status = 1;

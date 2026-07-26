@@ -72,7 +72,7 @@
 #define SHADPS4_ELF_PF_W 2
 #define SHADPS4_ELF_STT_FUNC 2
 #define SHADPS4_ELF_STT_OBJECT 1
-#define SHADPS4_HLE_TRAILER_SIZE 32
+#define SHADPS4_HLE_TRAILER_SIZE 64
 #define SHADPS4_HLE_BOOTSTRAP_SIZE 512
 #define SHADPS4_HLE_BOOTSTRAP_SLOT_SIZE (SHADPS4_HLE_BOOTSTRAP_SIZE / 2)
 #define SHADPS4_SCHEDULER_QUANTUM_NS (2 * 1000 * 1000)
@@ -142,6 +142,8 @@ static bool shadps4_apply_guest_thread_switch(ShadPS4MachineState *sms,
                                                CPUState *cs);
 static bool shadps4_block_guest_thread(ShadPS4MachineState *sms,
                                         CPUState *cs, uint64_t result);
+static ShadPS4GuestThreadContext *shadps4_thread_context(
+    ShadPS4MachineState *sms, uint64_t handle);
 
 static void shadps4_report_unresolved_image(const ShadPS4ImageInfo *image,
                                             const char *label)
@@ -222,6 +224,10 @@ static void shadps4_hle_gateway_write(void *opaque, hwaddr addr,
     uint64_t result;
     bool blocked_without_replacement = false;
     bool flush_all_tlbs = false;
+    bool signal_delivery = false;
+    bool signal_return = false;
+    bool fatal_fault = false;
+    bool exiting_thread;
     bool switched;
 
     if (!cs) {
@@ -234,6 +240,7 @@ static void shadps4_hle_gateway_write(void *opaque, hwaddr addr,
         qemu_mutex_unlock(&sms->scheduler_lock);
     }
     env = &X86_CPU(cs)->env;
+    exiting_thread = value == SHADPS4_HLE_PTHREAD_EXIT;
     nonvolatile_before[0] = env->regs[R_EBX];
     nonvolatile_before[1] = env->regs[R_EBP];
     nonvolatile_before[2] = env->regs[R_R12];
@@ -252,12 +259,13 @@ static void shadps4_hle_gateway_write(void *opaque, hwaddr addr,
     }
     qemu_mutex_lock(&sms->hle_lock);
     result = shadps4_hle_dispatch(&sms->hle, cs, value);
-    if (nonvolatile_before[0] != env->regs[R_EBX] ||
-        nonvolatile_before[1] != env->regs[R_EBP] ||
-        nonvolatile_before[2] != env->regs[R_R12] ||
-        nonvolatile_before[3] != env->regs[R_R13] ||
-        nonvolatile_before[4] != env->regs[R_R14] ||
-        nonvolatile_before[5] != env->regs[R_R15]) {
+    if (value != SHADPS4_HLE_INTERNAL_SIGNAL_RETURN &&
+        (nonvolatile_before[0] != env->regs[R_EBX] ||
+         nonvolatile_before[1] != env->regs[R_EBP] ||
+         nonvolatile_before[2] != env->regs[R_R12] ||
+         nonvolatile_before[3] != env->regs[R_R13] ||
+         nonvolatile_before[4] != env->regs[R_R14] ||
+         nonvolatile_before[5] != env->regs[R_R15])) {
         error_report("shadPS4 HLE corrupted nonvolatile guest registers: "
                      "number=%#" PRIx64 " rbx=%#" PRIx64 "->%#" PRIx64,
                      value, nonvolatile_before[0], env->regs[R_EBX]);
@@ -272,7 +280,8 @@ static void shadps4_hle_gateway_write(void *opaque, hwaddr addr,
     } else if (cs->cpu_index < ARRAY_SIZE(sms->hle.cpu_results)) {
         sms->hle.cpu_results[cs->cpu_index] = result;
     }
-    if (value != UINT64_MAX) {
+    if (value != SHADPS4_HLE_INTERNAL_FAULT &&
+        value != SHADPS4_HLE_INTERNAL_SIGNAL_RETURN) {
         sms->hle.last_hle_result = result;
         shadps4_hle_complete_call(&sms->hle, result);
     }
@@ -291,16 +300,40 @@ static void shadps4_hle_gateway_write(void *opaque, hwaddr addr,
     }
     flush_all_tlbs = sms->hle.tlb_flush_all_requested;
     sms->hle.tlb_flush_all_requested = false;
+    signal_delivery = sms->hle.signal_delivery_requested;
+    sms->hle.signal_delivery_requested = false;
+    signal_return = sms->hle.signal_return_requested;
+    sms->hle.signal_return_requested = false;
+    fatal_fault = sms->hle.fatal_fault_requested;
+    sms->hle.fatal_fault_requested = false;
     qemu_mutex_unlock(&sms->hle_lock);
+    if (signal_delivery) {
+        qemu_mutex_lock(&sms->scheduler_lock);
+        if (sms->pending_thread_switch[cs->cpu_index]) {
+            uint64_t pending =
+                sms->pending_thread_switch[cs->cpu_index];
+            ShadPS4GuestThreadContext *pending_context =
+                shadps4_thread_context(sms, pending);
+
+            if (pending_context) {
+                pending_context->schedule_order = ++sms->scheduler_order;
+                pending_context->runnable = true;
+            }
+            sms->pending_thread_switch[cs->cpu_index] = 0;
+        }
+        qemu_mutex_unlock(&sms->scheduler_lock);
+    }
     if (flush_all_tlbs) {
         tlb_flush_all_cpus_synced(cs);
     }
     switched = shadps4_apply_guest_thread_switch(sms, cs);
-    if (blocked_without_replacement) {
+    if (fatal_fault || blocked_without_replacement ||
+        (exiting_thread && !switched)) {
         cs->halted = 1;
         cpu_interrupt(cs, CPU_INTERRUPT_HALT);
     }
-    if (switched || blocked_without_replacement) {
+    if (fatal_fault || switched || blocked_without_replacement || signal_return ||
+        exiting_thread) {
         qemu_mutex_lock(&sms->scheduler_lock);
         sms->hle_gateway_active[cs->cpu_index] = false;
         qemu_mutex_unlock(&sms->scheduler_lock);
@@ -599,7 +632,7 @@ static bool shadps4_build_descriptor_tables(CPUX86State *env, Error **errp)
 
         memcpy(gate, &offset_low, sizeof(offset_low));
         memcpy(gate + 2, &selector, sizeof(selector));
-        gate[5] = 0x8e;
+        gate[5] = i == 0x44 ? 0xee : 0x8e;
         memcpy(gate + 6, &offset_mid, sizeof(offset_mid));
         memcpy(gate + 8, &offset_high, sizeof(offset_high));
     }
@@ -634,7 +667,9 @@ static bool shadps4_build_gateway(Error **errp)
         0x50,
         0x48, 0xb8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
         0x48, 0xa3, 0x00, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0xfa, 0xf4, 0xeb, 0xfd,
+        0x58,
+        0x48, 0x83, 0xc4, 0x10,
+        0x48, 0xcf,
     };
     static const uint8_t exit_stub[] = {
         0xb8, 0x01, 0x00, 0x00, 0x00,
@@ -1159,14 +1194,28 @@ static void shadps4_save_guest_thread(ShadPS4MachineState *sms,
 {
     ShadPS4GuestThreadContext *context = shadps4_thread_context(sms, handle);
     CPUX86State *env = &X86_CPU(cs)->env;
+    uint64_t resume_eip;
 
     if (!context) {
         return;
     }
+    resume_eip = env->regs[R_ECX];
+    if (!resume_eip) {
+        /*
+         * HLE exports use SYSCALL, so RCX normally contains the instruction
+         * after SYSCALL.  Never destroy an already valid context when an
+         * asynchronous transition observes the CPU before RCX is committed.
+         */
+        resume_eip = context->valid ? context->eip : env->eip;
+        warn_report("shadPS4 scheduler: missing syscall resume RIP "
+                    "cpu=%u thread=%#" PRIx64 " fallback=%#" PRIx64,
+                    cs->cpu_index, handle, resume_eip);
+    }
     memcpy(context->regs, env->regs, sizeof(context->regs));
     context->regs[R_EAX] = result;
-    context->eip = env->regs[R_ECX];
-    context->eflags = env->regs[R_R11];
+    context->eip = resume_eip;
+    context->eflags = env->regs[R_R11] ?:
+                      cpu_compute_eflags(env);
     context->fs_base = env->segs[R_FS].base;
     context->gs_base = env->segs[R_GS].base;
     context->cr3 = env->cr[3];
@@ -1198,9 +1247,21 @@ static uint64_t shadps4_pick_guest_thread(ShadPS4MachineState *sms,
     for (uint32_t slot = 1; slot < ARRAY_SIZE(sms->thread_contexts); slot++) {
         ShadPS4GuestThreadContext *context = &sms->thread_contexts[slot];
         ShadPS4HLEPthreadAttr *attr = &sms->hle.pthread_attrs[slot];
+        uint64_t handle = 0x400 + slot;
+        bool running = false;
         uint32_t priority;
 
-        if (0x400 + slot == exclude || !context->valid || !context->runnable ||
+        for (uint32_t cpu = 1;
+             cpu < ARRAY_SIZE(sms->hle.cpu_thread_handles); cpu++) {
+            if (sms->hle.cpu_thread_handles[cpu] == handle ||
+                sms->pending_thread_switch[cpu] == handle) {
+                running = true;
+                break;
+            }
+        }
+        if (handle == exclude || running || !context->valid ||
+            !context->eip ||
+            !context->runnable ||
             !(attr->affinity & BIT(cpu_index))) {
             continue;
         }
@@ -1208,7 +1269,7 @@ static uint64_t shadps4_pick_guest_thread(ShadPS4MachineState *sms,
         if (!selected || priority < selected_priority ||
             (priority == selected_priority &&
              context->schedule_order < selected_order)) {
-            selected = 0x400 + slot;
+            selected = handle;
             selected_priority = priority;
             selected_order = context->schedule_order;
         }
@@ -1237,7 +1298,7 @@ static bool shadps4_schedule_guest_thread(ShadPS4MachineState *sms,
         ShadPS4GuestThreadContext *context =
             shadps4_thread_context(sms, current);
 
-        if (context) {
+        if (context && !requeue) {
             context->runnable = false;
         }
         qemu_mutex_unlock(&sms->scheduler_lock);
@@ -1289,10 +1350,13 @@ static bool shadps4_wake_guest_thread(void *opaque, uint32_t cpu_index,
     ShadPS4GuestThreadContext *context;
 
     qemu_mutex_lock(&sms->scheduler_lock);
-    if (cpu_index < ARRAY_SIZE(sms->hle.cpu_thread_handles) &&
-        sms->hle.cpu_thread_handles[cpu_index] == handle) {
-        qemu_mutex_unlock(&sms->scheduler_lock);
-        return false;
+    for (uint32_t cpu = 1;
+         cpu < ARRAY_SIZE(sms->hle.cpu_thread_handles); cpu++) {
+        if (sms->hle.cpu_thread_handles[cpu] == handle ||
+            sms->pending_thread_switch[cpu] == handle) {
+            qemu_mutex_unlock(&sms->scheduler_lock);
+            return false;
+        }
     }
     context = shadps4_thread_context(sms, handle);
     if (!context || !context->valid) {
@@ -1369,6 +1433,12 @@ static void shadps4_preempt_guest_thread(CPUState *cs,
         return;
     }
     current = sms->hle.cpu_thread_handles[cpu_index];
+    if (current > 0x400 &&
+        current - 0x400 < ARRAY_SIZE(sms->hle.signal_contexts) &&
+        sms->hle.signal_contexts[current - 0x400]) {
+        qemu_mutex_unlock(&sms->scheduler_lock);
+        return;
+    }
     if (current > 0x400 &&
         current - 0x400 < ARRAY_SIZE(sms->hle.wait_kind) &&
         sms->hle.wait_kind[current - 0x400] != SHADPS4_HLE_WAIT_NONE) {
@@ -1498,6 +1568,7 @@ static bool shadps4_apply_guest_thread_switch(ShadPS4MachineState *sms,
         qemu_mutex_unlock(&sms->scheduler_lock);
         return false;
     }
+    context->runnable = false;
     env = &X86_CPU(cs)->env;
     memcpy(env->regs, context->regs, sizeof(context->regs));
     env->eip = context->eip;
@@ -1563,6 +1634,10 @@ static int shadps4_start_guest_thread(void *opaque, uint64_t handle,
         memset(context, 0, sizeof(*context));
         context->regs[R_ESP] = stack_pointer;
         context->regs[R_EDI] = argument;
+        if (entry == sms->hle.thread_return_address) {
+            context->regs[R_EAX] =
+                sms->hle.service_user_data[handle - 0x400];
+        }
         if (sms->hle.thread_process_ids[handle - 0x400] == 2) {
             context->regs[R_ESI] = SHADPS4_EXIT_STUB_VIRT;
         }
@@ -1616,6 +1691,9 @@ static int shadps4_start_guest_thread(void *opaque, uint64_t handle,
     env->eip = entry;
     env->regs[R_ESP] = stack_pointer;
     env->regs[R_EDI] = argument;
+    if (entry == sms->hle.thread_return_address) {
+        env->regs[R_EAX] = sms->hle.service_user_data[handle - 0x400];
+    }
     if (sms->hle.thread_process_ids[handle - 0x400] == 2) {
         env->regs[R_ESI] = SHADPS4_EXIT_STUB_VIRT;
     }
@@ -1630,11 +1708,15 @@ static int shadps4_start_guest_thread(void *opaque, uint64_t handle,
     sms->thread_contexts[handle - 0x400].eflags = cpu_compute_eflags(env);
     sms->thread_contexts[handle - 0x400].fs_base = gs_base;
     sms->thread_contexts[handle - 0x400].gs_base = gs_base;
+    sms->thread_contexts[handle - 0x400].cr3 = env->cr[3];
     sms->thread_contexts[handle - 0x400].mxcsr = env->mxcsr;
     sms->thread_contexts[handle - 0x400].fpuc = env->fpuc;
     sms->thread_contexts[handle - 0x400].fpus = env->fpus;
     sms->thread_contexts[handle - 0x400].fpstt = env->fpstt;
+    sms->thread_contexts[handle - 0x400].schedule_order =
+        ++sms->scheduler_order;
     sms->thread_contexts[handle - 0x400].valid = true;
+    sms->thread_contexts[handle - 0x400].runnable = false;
     cs->halted = 0;
     cpu_reset_interrupt(cs, CPU_INTERRUPT_HALT);
     tlb_flush(cs);
@@ -1791,6 +1873,38 @@ typedef enum ShadPS4HLEDataKind {
     { (nid_), "libc", "libc", (dispatch_), SHADPS4_HLE_DATA_NONE }
 
 static const ShadPS4HLEExport shadps4_hle_exports[] = {
+    /* Platform probes and optional offline services.  These are real PS4
+     * imports (not unresolved fallbacks): the corresponding facilities have
+     * no host-side state in the local HLE environment, so their documented
+     * no-op/offline result is success. */
+    { "mpxAdqW7dKY", "libkernel_cpumode_platform", "libkernel",
+      SHADPS4_HLE_SUCCESS, SHADPS4_HLE_DATA_NONE }, /* sceKernelIsProspero */
+    { "vT9xhqPO6+0", "libSceNpUtility", "libSceNpUtility",
+      SHADPS4_HLE_SUCCESS, SHADPS4_HLE_DATA_NONE }, /* sceNpLookupCreateTitleCtxA */
+    { "mtqDK9zkoIE", "libSceNpUtility", "libSceNpUtility",
+      SHADPS4_HLE_SUCCESS, SHADPS4_HLE_DATA_NONE }, /* sceNpLookupDeleteTitleCtx */
+    { "wLaxchvEEnk", "libSceNpUtility", "libSceNpUtility",
+      SHADPS4_HLE_SUCCESS, SHADPS4_HLE_DATA_NONE }, /* sceNpLookupDeleteRequest */
+    { "V4EVrruHuy8", "libSceNpUtility", "libSceNpUtility",
+      SHADPS4_HLE_SUCCESS, SHADPS4_HLE_DATA_NONE }, /* sceNpLookupPollAsync */
+    SHADPS4_HLE_EXPORT("n01yNbQO5W4", "libScePosix",
+                       SHADPS4_HLE_SUCCESS), /* fchmod */
+    SHADPS4_HLE_EXPORT("+0EDo7YzcoU", "libScePosix",
+                       SHADPS4_HLE_SUCCESS), /* futimes */
+    SHADPS4_HLE_EXPORT("GDuV00CHrUg", "libScePosix",
+                       SHADPS4_HLE_SUCCESS), /* utimes */
+    SHADPS4_HLE_EXPORT("04AjkP0jO9U", "libkernel",
+                       SHADPS4_HLE_SUCCESS), /* _umtx_op */
+    SHADPS4_HLE_EXPORT("E7CmfLfeSuQ", "libkernel",
+                       SHADPS4_HLE_SUCCESS), /* __sys_namedobj_delete */
+    SHADPS4_HLE_EXPORT("3CNY4Z0Luc8", "libkernel",
+                       SHADPS4_HLE_SUCCESS), /* __sys_namedobj_create */
+    SHADPS4_HLE_EXPORT("nYBrkGDqxh8", "libkernel",
+                       SHADPS4_HLE_SUCCESS), /* pthread_testcancel */
+    { "BG26hBGiNlw", "ulobjmgr", "ulobjmgr",
+      SHADPS4_HLE_ULOBJ_REGISTER, SHADPS4_HLE_DATA_NONE },
+    { "Smf+fUNblPc", "ulobjmgr", "ulobjmgr",
+      SHADPS4_HLE_ULOBJ_UNREGISTER, SHADPS4_HLE_DATA_NONE },
     SHADPS4_HLE_LIBC_EXPORT("gQX+4GDQjpM", SHADPS4_HLE_LIBC_MALLOC),
     SHADPS4_HLE_LIBC_EXPORT("tIhsqj0qsFE", SHADPS4_HLE_LIBC_FREE),
     SHADPS4_HLE_LIBC_EXPORT("2X5agFjKxMc", SHADPS4_HLE_LIBC_CALLOC),
@@ -4388,7 +4502,7 @@ static uint32_t shadps4_hle_compat_dispatch(const char *library,
         HLE_MAP("aEzKdJzATZ0", SHADPS4_HLE_NP_PARTY_NOT_IN_PARTY),
         HLE_MAP("v2RYVGrJDkM", SHADPS4_HLE_NP_PARTY_NOT_IN_PARTY),
         HLE_MAP("pQfYTZHznMc", SHADPS4_HLE_NP_PARTNER_ABORT),
-        HLE_MAP("cE5Msy11WhU", SHADPS4_HLE_COMPANION_GET_EVENT),
+        HLE_MAP("cE5Msy11WhU", SHADPS4_HLE_COMPANION_UTIL_GET_EVENT),
         HLE_MAP("BQ3tey0JmQM", SHADPS4_HLE_COMMON_DIALOG_IS_USED),
         HLE_MAP("Vku4big+IYM", SHADPS4_HLE_COMPANION_GET_EVENT),
         HLE_MAP("ekXHb1kDBl0", SHADPS4_HLE_ERROR_DIALOG_CLOSE),
@@ -5329,6 +5443,58 @@ static uint32_t shadps4_hle_compat_dispatch(const char *library,
             return dispatch;
         }
     }
+    /* These APIs are optional platform services for the Unity titles we
+     * support.  shadPS4 exposes them as successful no-op services when the
+     * corresponding console facility is unavailable. */
+    if (!g_strcmp0(module, "libSceSocialScreenDialog")) {
+        static const char social_dialog_nids[] =
+            "|WjHT5TmV0TQ|PEe0R7gBHbc|eL54zY-B+-Y|A4KPdcTIVuc|"
+            "BEhMn+TyoGA|4ej3RtYH320|";
+        if (g_snprintf(ssl_nid_token, sizeof(ssl_nid_token), "|%s|", nid) > 0 &&
+            strstr(social_dialog_nids, ssl_nid_token)) {
+            return SHADPS4_HLE_SUCCESS;
+        }
+    }
+    if (!g_strcmp0(module, "libSceSocialScreen")) {
+        static const char social_nids[] =
+            "|VMM7wQBZoBk|6Me4hYsy3Kc|SvdXHHt2LLE|vtZIn9HtYbs|"
+            "pI7oFSPP65A|OVNpYTRqN74|IEzqdjIueps|";
+        if (g_snprintf(ssl_nid_token, sizeof(ssl_nid_token), "|%s|", nid) > 0 &&
+            strstr(social_nids, ssl_nid_token)) {
+            return SHADPS4_HLE_SUCCESS;
+        }
+    }
+    if (!g_strcmp0(module, "libSceNpManager") ||
+        !g_strcmp0(module, "libSceNpUtility")) {
+        static const char np_optional_nids[] =
+            "|Gaxrp3EWY-M|Ubv+fP58W1U|PQDFxcnqxtw|kvdMF48mB3Y|"
+            "BYIZGKm6bO4|jktww3yJXnc|pLr1fEQS1z8|s4UEa5iBJdc|"
+            "+anuSx2avHQ|GFhVUpRmbHE|IkL62FMpIpo|bMG3cVmUmuk|"
+            "rAOOqDAxBIk|iCq5xW5KQW4|6p9jvljuvsw|PYFS1H70bDs|"
+            "t0P5z5yuFPA|Jj4mkpFO2gE|";
+        if (g_snprintf(ssl_nid_token, sizeof(ssl_nid_token), "|%s|", nid) > 0 &&
+            strstr(np_optional_nids, ssl_nid_token)) {
+            return SHADPS4_HLE_SUCCESS;
+        }
+    }
+    if (!g_strcmp0(module, "ulobjmgr")) {
+        if (!strcmp(nid, "BG26hBGiNlw")) {
+            return SHADPS4_HLE_ULOBJ_REGISTER;
+        }
+        if (!strcmp(nid, "Smf+fUNblPc")) {
+            return SHADPS4_HLE_ULOBJ_UNREGISTER;
+        }
+    }
+    if (!g_strcmp0(module, "libkernel") &&
+        (!strcmp(nid, "0Cq8ipKr9n0") || !strcmp(nid, "fgIsQ10xYVA") ||
+         !strcmp(nid, "0D4-FVvEikw") || !strcmp(nid, "8nY19bKoiZk") ||
+         !strcmp(nid, "z0dtnPxYgtg"))) {
+        return SHADPS4_HLE_SUCCESS;
+    }
+    if (!g_strcmp0(module, "libSceVideoOut") &&
+        !strcmp(nid, "ktP9j1fN-zE")) {
+        return SHADPS4_HLE_SUCCESS;
+    }
     if (!g_strcmp0(module, "libSceWebBrowserDialog") ||
         !g_strcmp0(module, "libSceSigninDialog") ||
         !g_strcmp0(module, "libSceSystemServiceActivateHevc") ||
@@ -5572,14 +5738,42 @@ static bool shadps4_build_hle_image(ShadPS4MachineState *sms,
 
     {
         uint8_t trailer[32] = { 0 };
+        static const uint8_t signal_return_stub[16] = {
+            0x48, 0xb8, 0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0x0f, 0x05, 0x0f, 0x0b, 0x90, 0x90,
+        };
+        uint8_t thread_return_stub[16] = {
+            0xff, 0xd0,
+            0x48, 0x89, 0xc7,
+            0xb8, 0, 0, 0, 0,
+            0x0f, 0x05,
+            0xeb, 0xfe,
+            0x90, 0x90,
+        };
+
+        stl_le_p(thread_return_stub + 6, SHADPS4_HLE_PTHREAD_EXIT);
 
         memcpy(trailer + 8, "eboot.bin", sizeof("eboot.bin"));
         if (!shadps4_write_guest(
                 image->physical_base + image->symbol_count * 16,
-                trailer, sizeof(trailer), "HLE data trailer", errp)) {
+                trailer, sizeof(trailer), "HLE data trailer", errp) ||
+            !shadps4_write_guest(
+                image->physical_base + image->symbol_count * 16 +
+                    sizeof(trailer),
+                signal_return_stub, sizeof(signal_return_stub),
+                "HLE signal return stub", errp) ||
+            !shadps4_write_guest(
+                image->physical_base + image->symbol_count * 16 +
+                    sizeof(trailer) + sizeof(signal_return_stub),
+                thread_return_stub, sizeof(thread_return_stub),
+                "HLE pthread return stub", errp)) {
             shadps4_image_cleanup(image);
             return false;
         }
+        sms->hle.signal_return_address =
+            image->virtual_base + image->symbol_count * 16 + sizeof(trailer);
+        sms->hle.thread_return_address =
+            sms->hle.signal_return_address + sizeof(signal_return_stub);
     }
 
     for (i = 0; i < image->symbol_count; i++) {
@@ -5672,6 +5866,88 @@ static gint shadps4_compare_module_names(gconstpointer left,
     return g_strcmp0(*left_name, *right_name);
 }
 
+/* Add regular PRX/SPRX files from one title-relative module directory.
+ * Store complete paths so callers can merge directories without losing the
+ * source directory (notably Media/Modules and Media/Plugins). */
+static bool shadps4_collect_module_directory(const char *directory,
+                                             bool brokered,
+                                             GPtrArray *modules,
+                                             uint32_t *found,
+                                             uint32_t *ignored,
+                                             uint32_t *invalid,
+                                             Error **errp)
+{
+    if (brokered) {
+        int64_t handle;
+        int ret = qemu_host_storage_open(directory,
+                                         O_RDONLY | QEMU_HOST_STORAGE_OPEN_DIRECTORY,
+                                         0, &handle);
+
+        if (ret == -ENOENT) {
+            return true;
+        }
+        if (ret < 0) {
+            error_setg_errno(errp, -ret, "failed to open brokered module directory '%s'",
+                             directory);
+            return false;
+        }
+        for (;;) {
+            QemuHostStorageStat stat;
+            char name[256];
+
+            ret = qemu_host_storage_readdir(handle, name, sizeof(name), &stat);
+            if (ret <= 0) {
+                break;
+            }
+            (*found)++;
+            name[sizeof(name) - 1] = 0;
+            if (!name[0] || strchr(name, '/') || strchr(name, '\\')) {
+                (*invalid)++;
+                ret = -EIO;
+                break;
+            }
+            if (g_str_has_suffix(name, ".prx") || g_str_has_suffix(name, ".sprx")) {
+                g_ptr_array_add(modules, g_strdup_printf("%s/%s", directory, name));
+            } else {
+                (*ignored)++;
+            }
+        }
+        if (qemu_host_storage_close(handle) < 0 && ret >= 0) {
+            ret = -EIO;
+        }
+        if (ret < 0) {
+            error_setg_errno(errp, -ret, "failed to enumerate brokered module directory '%s'",
+                             directory);
+            return false;
+        }
+        return true;
+    } else {
+        GError *gerror = NULL;
+        GDir *dir = g_dir_open(directory, 0, &gerror);
+
+        if (!dir) {
+            if (g_error_matches(gerror, G_FILE_ERROR, G_FILE_ERROR_NOENT)) {
+                g_clear_error(&gerror);
+                return true;
+            }
+            error_setg(errp, "failed to enumerate module directory '%s': %s",
+                       directory, gerror->message);
+            g_clear_error(&gerror);
+            return false;
+        }
+        for (const char *name; (name = g_dir_read_name(dir)); ) {
+            (*found)++;
+            if (g_str_has_suffix(name, ".prx") || g_str_has_suffix(name, ".sprx")) {
+                g_ptr_array_add(modules, g_build_filename(directory, name, NULL));
+            } else {
+                (*ignored)++;
+            }
+        }
+        g_dir_close(dir);
+        return true;
+    }
+}
+
 static void shadps4_cleanup_images(ShadPS4MachineState *sms)
 {
     uint32_t i;
@@ -5736,6 +6012,8 @@ static bool shadps4_load_images(ShadPS4MachineState *sms,
     bool brokered = qemu_host_storage_path_is_brokered(filename);
     g_autofree char *root = NULL;
     g_autofree char *module_dir = NULL;
+    g_autofree char *media_modules_dir = NULL;
+    g_autofree char *media_plugins_dir = NULL;
     g_autofree char *ps2_compiler = NULL;
     const char *main_filename = filename;
     g_autoptr(GPtrArray) module_names =
@@ -5757,12 +6035,18 @@ static bool shadps4_load_images(ShadPS4MachineState *sms,
                g_strndup(filename, separator - filename);
         module_dir = !strcmp(root, "/") ? g_strdup("/sce_module") :
                      g_strdup_printf("%s/sce_module", root);
+        media_modules_dir = !strcmp(root, "/") ? g_strdup("/Media/Modules") :
+                            g_strdup_printf("%s/Media/Modules", root);
+        media_plugins_dir = !strcmp(root, "/") ? g_strdup("/Media/Plugins") :
+                            g_strdup_printf("%s/Media/Plugins", root);
         ps2_compiler = !strcmp(root, "/") ?
                        g_strdup("/ps2-emu-compiler.self") :
                        g_strdup_printf("%s/ps2-emu-compiler.self", root);
     } else {
         root = g_path_get_dirname(filename);
         module_dir = g_build_filename(root, "sce_module", NULL);
+        media_modules_dir = g_build_filename(root, "Media", "Modules", NULL);
+        media_plugins_dir = g_build_filename(root, "Media", "Plugins", NULL);
         ps2_compiler = g_build_filename(root, "ps2-emu-compiler.self", NULL);
     }
 
@@ -5772,7 +6056,7 @@ static bool shadps4_load_images(ShadPS4MachineState *sms,
 
             ps2_compiler_exists =
                 qemu_host_storage_stat(ps2_compiler, &stat) == 0 &&
-                stat.type == 8; /* DT_REG in the brokered storage ABI. */
+                (stat.type == 8 || stat.type == 1);
         } else {
             ps2_compiler_exists =
                 g_file_test(ps2_compiler, G_FILE_TEST_IS_REGULAR);
@@ -5890,6 +6174,17 @@ static bool shadps4_load_images(ShadPS4MachineState *sms,
         }
         g_clear_error(&gerror);
     }
+    if (!shadps4_collect_module_directory(media_modules_dir, brokered,
+                                          module_names, &module_entries_found,
+                                          &module_entries_ignored,
+                                          &module_entries_invalid, errp) ||
+        !shadps4_collect_module_directory(media_plugins_dir, brokered,
+                                          module_names, &module_entries_found,
+                                          &module_entries_ignored,
+                                          &module_entries_invalid, errp)) {
+        shadps4_cleanup_images(sms);
+        return false;
+    }
     info_report("shadPS4 sce_module enumeration: found=%u loadable=%u "
                 "ignored=%u invalid=%u ignored_unsupported_extension=%u",
                 module_entries_found, module_names->len,
@@ -5899,9 +6194,10 @@ static bool shadps4_load_images(ShadPS4MachineState *sms,
 
     for (i = 0; i < module_names->len; i++) {
         const char *name = g_ptr_array_index(module_names, i);
-        g_autofree char *path = brokered ?
-            g_strdup_printf("%s/%s", module_dir, name) :
-            g_build_filename(module_dir, name, NULL);
+        g_autofree char *path = g_path_is_absolute(name) ? g_strdup(name) :
+            (brokered ? g_strdup_printf("%s/%s", module_dir, name) :
+             g_build_filename(module_dir, name, NULL));
+        g_autofree char *module_name = g_path_get_basename(name);
         ShadPS4ImageInfo *module;
 
         if (sms->module_count == SHADPS4_MAX_MODULES - 1) {
@@ -5929,7 +6225,7 @@ static bool shadps4_load_images(ShadPS4MachineState *sms,
         info_report("shadPS4 module loaded: %s base=0x%" PRIx64
                     " size=0x%" PRIx64 " TLS=%u init=%s0x%" PRIx64
                     " entry=0x%" PRIx64,
-                    name, module->virtual_base, module->image_size,
+                    module_name, module->virtual_base, module->image_size,
                     module->tls_module_id,
                     module->init_present ? "" : "absent/",
                     module->init, module->entry);

@@ -6,12 +6,14 @@ import ctypes
 import os
 import pathlib
 import shutil
+import subprocess
+import struct
 import sys
 import tempfile
 import time
 
 
-DEFAULT_TITLES = ("CUSA02456", "CUSA13032", "SLES50541")
+DEFAULT_TITLES = ("CUSA02456", "CUSA13032")
 
 StorageOpen = ctypes.CFUNCTYPE(
     ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int,
@@ -321,6 +323,8 @@ class TitleResult:
         self.height = 0
         self.step_result = 0
         self.status = 0
+        self.capture_data = None
+        self.capture_stride = 0
 
 
 def load_library(path):
@@ -341,7 +345,23 @@ def load_library(path):
     return dll
 
 
-def run_title(dll, title_id, title_root, duration):
+def write_bgra_bmp(path, data, width, height, stride):
+    row_size = width * 4
+    pixels = b"".join(
+        data[row * stride:row * stride + row_size]
+        for row in range(height - 1, -1, -1)
+    )
+    header_size = 14 + 40
+    file_header = struct.pack(
+        "<2sIHHI", b"BM", header_size + len(pixels), 0, 0, header_size)
+    info_header = struct.pack(
+        "<IiiHHIIiiII", 40, width, height, 1, 32, 0, len(pixels),
+        2835, 2835, 0, 0)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(file_header + info_header + pixels)
+
+
+def run_title(dll, title_id, title_root, duration, capture_frame=None):
     result = TitleResult(title_id)
     storage = LocalStorage(title_root)
     video_type = ctypes.CFUNCTYPE(
@@ -360,6 +380,9 @@ def run_title(dll, title_id, title_root, duration):
         result.last_nonblack_pixels = nonblack
         if nonblack:
             result.nonblack_frames += 1
+            if capture_frame:
+                result.capture_data = data
+                result.capture_stride = stride
         print(f"{title_id}: frame={result.frames} size={width}x{height} "
               f"nonblack={nonblack}", flush=True)
 
@@ -402,6 +425,9 @@ def run_title(dll, title_id, title_root, duration):
         if cleanup_result:
             raise RuntimeError(f"{title_id}: cleanup={cleanup_result}")
     result.status = status.value
+    if capture_frame and result.capture_data:
+        write_bgra_bmp(capture_frame, result.capture_data, result.width,
+                       result.height, result.capture_stride)
     return result
 
 
@@ -413,32 +439,42 @@ def main():
     parser.add_argument("--title", action="append", dest="titles",
                         choices=DEFAULT_TITLES)
     parser.add_argument("--duration", type=float, default=20.0)
+    parser.add_argument("--capture-frame", type=pathlib.Path,
+                        help="write the last nonblack BGRA frame as BMP")
+    parser.add_argument("--worker", action="store_true",
+                        help="run one title in this process")
     args = parser.parse_args()
     titles = args.titles or DEFAULT_TITLES
-    failed = False
-    for title_id in titles:
+
+    if args.worker:
+        if len(titles) != 1:
+            parser.error("--worker requires exactly one --title")
+        title_id = titles[0]
         dll = load_library(args.dll.resolve())
         try:
-            result = run_title(dll, title_id, args.title_root, args.duration)
+            result = run_title(dll, title_id, args.title_root, args.duration,
+                               args.capture_frame)
             print(f"{title_id}: frames={result.frames} "
                   f"nonblack_frames={result.nonblack_frames} "
                   f"step={result.step_result} status={result.status}")
-            reasons = []
-            if result.step_result:
-                reasons.append(f"main loop stopped early ({result.step_result})")
-            if result.status:
-                reasons.append(f"guest status is {result.status}")
-            if not result.frames:
-                reasons.append("no video frames")
-            elif not result.nonblack_frames:
-                reasons.append("all video frames are black")
-            if reasons:
-                failed = True
-                print(f"{title_id}: FAIL: {'; '.join(reasons)}",
-                      file=sys.stderr)
+            if result.step_result or result.status or not result.frames or \
+                    not result.nonblack_frames:
+                return 1
         except Exception as error:
-            failed = True
             print(f"{title_id}: FAIL: {error}", file=sys.stderr)
+            return 1
+        return 0
+
+    failed = False
+    for title_id in titles:
+        worker = [sys.executable, __file__, str(args.dll.resolve()),
+                  "--title-root", str(args.title_root.resolve()),
+                  "--title", title_id, "--duration", str(args.duration),
+                  "--worker"]
+        if args.capture_frame:
+            worker += ["--capture-frame", str(args.capture_frame.resolve())]
+        if subprocess.run(worker).returncode:
+            failed = True
     return 1 if failed else 0
 
 

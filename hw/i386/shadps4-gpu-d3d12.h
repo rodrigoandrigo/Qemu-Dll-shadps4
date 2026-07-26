@@ -34,5 +34,13 @@ bool shadps4_d3d12_read_surface(ShadPS4D3D12State *d3d12,
                                 uint32_t stride);
 bool shadps4_d3d12_publish_surface(ShadPS4D3D12State *d3d12,
                                    uint32_t index, uint64_t frame_id);
+/*
+ * Present the newest rendered VideoOut image when a title flips a buffer
+ * before it has been drawn to.  The guest-memory backing of that buffer is
+ * not necessarily kept coherent with the D3D12 render target.
+ */
+bool shadps4_d3d12_publish_latest_surface(ShadPS4D3D12State *d3d12,
+                                          uint32_t *index,
+                                          uint64_t frame_id);
 
 #endif /* HW_I386_SHADPS4_GPU_D3D12_H */

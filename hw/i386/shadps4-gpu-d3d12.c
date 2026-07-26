@@ -110,6 +110,8 @@ typedef struct ShadPS4D3D12BoundResource {
     ID3D12Resource *upload;
     ID3D12Resource *readback;
     uint8_t *mapped;
+    ID3D12Resource *frame_upload[SHADPS4_D3D12_FRAMES_IN_FLIGHT];
+    uint8_t *frame_mapped[SHADPS4_D3D12_FRAMES_IN_FLIGHT];
     uint64_t size;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT *footprints;
@@ -501,24 +503,7 @@ static uint64_t shadps4_d3d12_hash_bytes(uint64_t hash, const void *data,
 static void shadps4_d3d12_shader_clear(ShadPS4D3D12Shader *shader)
 {
     for (size_t i = 0; i < shader->resource_count; i++) {
-        ShadPS4D3D12BoundResource *bound = &shader->bound_resources[i];
-
-        if (bound->upload) {
-            if (bound->mapped) {
-                ID3D12Resource_Unmap(bound->upload, 0, NULL);
-            }
-            ID3D12Resource_Release(bound->upload);
-        } else if (bound->resource && bound->mapped) {
-            ID3D12Resource_Unmap(bound->resource, 0, NULL);
-        }
-        if (bound->resource) {
-            ID3D12Resource_Release(bound->resource);
-        }
-        if (bound->readback) {
-            ID3D12Resource_Release(bound->readback);
-        }
-        g_free(bound->footprints);
-        g_free(bound->footprint_rows);
+        shadps4_d3d12_bound_clear(&shader->bound_resources[i]);
     }
     shadps4_dxil_binary_clear(&shader->dxil);
     g_free(shader->resources);
@@ -2030,6 +2015,14 @@ static void shadps4_d3d12_bound_clear(ShadPS4D3D12BoundResource *bound)
     if (bound->readback) {
         ID3D12Resource_Release(bound->readback);
     }
+    for (uint32_t i = 0; i < SHADPS4_D3D12_FRAMES_IN_FLIGHT; i++) {
+        if (bound->frame_upload[i]) {
+            if (bound->frame_mapped[i]) {
+                ID3D12Resource_Unmap(bound->frame_upload[i], 0, NULL);
+            }
+            ID3D12Resource_Release(bound->frame_upload[i]);
+        }
+    }
     g_free(bound->footprints);
     g_free(bound->footprint_rows);
     memset(bound, 0, sizeof(*bound));
@@ -2269,6 +2262,9 @@ static bool shadps4_d3d12_prepare_linear_image(
     uint32_t levels = MIN(MAX(resource->levels, 1), 16);
     uint32_t layers = MAX(resource->layers, 1);
     uint32_t subresources;
+    ID3D12Resource **upload;
+    uint8_t **mapped;
+    bool writable = resource->flags & SHADPS4_GCN_RESOURCE_WRITTEN;
     HRESULT hr;
 
     shadps4_d3d12_image_view_desc(resource, &texture_desc);
@@ -2301,29 +2297,14 @@ static bool shadps4_d3d12_prepare_linear_image(
         ID3D12Device_GetCopyableFootprints(d3d12->device, &texture_desc,
             0, subresources, 0, bound->footprints, bound->footprint_rows,
             NULL, &upload_size);
-        upload_desc.Width = upload_size;
-        hr = ID3D12Device_CreateCommittedResource(
-            d3d12->device, &upload_heap, D3D12_HEAP_FLAG_NONE,
-            &upload_desc, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
-            &IID_ID3D12Resource, (void **)&bound->upload);
-        if (FAILED(hr)) {
-            shadps4_d3d12_report("Create guest image upload", hr);
-            shadps4_d3d12_bound_clear(bound);
-            return false;
-        }
-        hr = ID3D12Resource_Map(bound->upload, 0, &read_range,
-                                (void **)&bound->mapped);
-        if (FAILED(hr)) {
-            shadps4_d3d12_bound_clear(bound);
-            return false;
-        }
         bound->size = guest_size;
         bound->upload_size = upload_size;
         bound->subresource_count = subresources;
         bound->state = D3D12_RESOURCE_STATE_COPY_DEST;
-        if (resource->flags & SHADPS4_GCN_RESOURCE_WRITTEN) {
+        if (writable) {
             D3D12_HEAP_PROPERTIES readback_heap = upload_heap;
 
+            upload_desc.Width = upload_size;
             readback_heap.Type = D3D12_HEAP_TYPE_READBACK;
             hr = ID3D12Device_CreateCommittedResource(
                 d3d12->device, &readback_heap, D3D12_HEAP_FLAG_NONE,
@@ -2335,12 +2316,33 @@ static bool shadps4_d3d12_prepare_linear_image(
             }
         }
     }
+    upload = writable ? &bound->upload :
+        &bound->frame_upload[d3d12->frame_index];
+    mapped = writable ? &bound->mapped :
+        &bound->frame_mapped[d3d12->frame_index];
+    if (!*upload) {
+        upload_desc.Width = bound->upload_size;
+        hr = ID3D12Device_CreateCommittedResource(
+            d3d12->device, &upload_heap, D3D12_HEAP_FLAG_NONE,
+            &upload_desc, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+            &IID_ID3D12Resource, (void **)upload);
+        if (FAILED(hr)) {
+            shadps4_d3d12_report("Create guest image upload", hr);
+            return false;
+        }
+        hr = ID3D12Resource_Map(*upload, 0, &read_range, (void **)mapped);
+        if (FAILED(hr)) {
+            ID3D12Resource_Release(*upload);
+            *upload = NULL;
+            return false;
+        }
+    }
     guest_pixels = g_malloc(guest_size);
     if (cpu_memory_rw_debug(cs, resource->guest_address,
                             guest_pixels, guest_size, false) != 0) {
         return false;
     }
-    memset(bound->mapped, 0, bound->upload_size);
+    memset(*mapped, 0, bound->upload_size);
     for (uint32_t layer = 0; layer < layers; layer++) {
         for (uint32_t mip = 0; mip < levels; mip++) {
             ShadPS4GcnResource layout = *resource;
@@ -2366,7 +2368,7 @@ static bool shadps4_d3d12_prepare_linear_image(
                 MAX(resource->pitch >> mip, 1);
             layout.height = resource->mip_height[mip] ?: copy_height;
             for (uint32_t z = 0; z < depth; z++) {
-                uint8_t *dest_slice = bound->mapped + fp->Offset +
+                uint8_t *dest_slice = *mapped + fp->Offset +
                     (uint64_t)z * fp->Footprint.RowPitch *
                     bound->footprint_rows[subresource];
 
@@ -2405,7 +2407,7 @@ static bool shadps4_d3d12_prepare_linear_image(
     }
     for (uint32_t i = 0; i < subresources; i++) {
         D3D12_TEXTURE_COPY_LOCATION source_location = {
-            .pResource = bound->upload,
+            .pResource = *upload,
             .Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             .PlacedFootprint = bound->footprints[i],
         };
@@ -2774,7 +2776,15 @@ static bool shadps4_d3d12_prepare_shader_resources(
         if (!size || size > UINT64_C(256) * 1024 * 1024) {
             return false;
         }
-        if (!bound->resource || bound->size != size) {
+        ID3D12Resource **frame_resource =
+            &bound->frame_upload[d3d12->frame_index];
+        uint8_t **frame_mapped =
+            &bound->frame_mapped[d3d12->frame_index];
+
+        if (bound->size && bound->size != size) {
+            shadps4_d3d12_bound_clear(bound);
+        }
+        if (!*frame_resource) {
             D3D12_HEAP_PROPERTIES heap = {
                 .Type = D3D12_HEAP_TYPE_UPLOAD,
                 .CreationNodeMask = 1,
@@ -2792,26 +2802,27 @@ static bool shadps4_d3d12_prepare_shader_resources(
             D3D12_RANGE read_range = { 0, 0 };
             HRESULT hr;
 
-            shadps4_d3d12_bound_clear(bound);
             hr = ID3D12Device_CreateCommittedResource(
                 d3d12->device, &heap, D3D12_HEAP_FLAG_NONE, &desc,
                 D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
-                &IID_ID3D12Resource, (void **)&bound->resource);
+                &IID_ID3D12Resource, (void **)frame_resource);
             if (FAILED(hr)) {
                 shadps4_d3d12_report("Create guest buffer", hr);
                 return false;
             }
-            hr = ID3D12Resource_Map(bound->resource, 0, &read_range,
-                                    (void **)&bound->mapped);
+            hr = ID3D12Resource_Map(*frame_resource, 0, &read_range,
+                                    (void **)frame_mapped);
             if (FAILED(hr)) {
+                ID3D12Resource_Release(*frame_resource);
+                *frame_resource = NULL;
                 return false;
             }
             bound->size = size;
         }
         if (source) {
-            memcpy(bound->mapped, source, size);
+            memcpy(*frame_mapped, source, size);
         } else if (cpu_memory_rw_debug(cs, resource->guest_address,
-                                       bound->mapped, size, false) != 0) {
+                                       *frame_mapped, size, false) != 0) {
             return false;
         }
         D3D12_SHADER_RESOURCE_VIEW_DESC view = {
@@ -2825,7 +2836,7 @@ static bool shadps4_d3d12_prepare_shader_resources(
             },
         };
         ID3D12Device_CreateShaderResourceView(
-            d3d12->device, bound->resource, &view, handle);
+            d3d12->device, *frame_resource, &view, handle);
     }
     return true;
 }
@@ -3220,6 +3231,21 @@ static bool shadps4_d3d12_record_draw(ShadPS4D3D12State *d3d12,
         d3d12->depth_surfaces[depth_target].width;
     target_height = surface ? surface->height :
         d3d12->depth_surfaces[depth_target].height;
+    if (d3d12->submit_count == 1) {
+        g_autoptr(GString) target_list = g_string_new(NULL);
+
+        for (uint32_t i = 0; i < target_count; i++) {
+            ShadPS4D3D12Surface *target = &d3d12->surfaces[targets[i]];
+
+            g_string_append_printf(
+                target_list, "%s%d:%#" PRIx64 ":%ux%u%s",
+                i ? "," : "", targets[i], target->guest_address,
+                target->width, target->height,
+                target->video_out ? ":video" : ":offscreen");
+        }
+        info_report("shadPS4 D3D12 initial draw target(s): [%s]",
+                    target_list->str);
+    }
     for (uint32_t i = 0; i < target_count; i++) {
         ShadPS4D3D12Surface *target = &d3d12->surfaces[targets[i]];
 
@@ -3977,6 +4003,7 @@ bool shadps4_d3d12_submit(ShadPS4D3D12State *d3d12,
     uint64_t draws = 0;
     uint64_t emitted_draws = 0;
     uint64_t dispatches = 0;
+    uint64_t command_hash;
     uint32_t opcode_counts[256] = { 0 };
     HRESULT hr;
 
@@ -3987,6 +4014,9 @@ bool shadps4_d3d12_submit(ShadPS4D3D12State *d3d12,
         shader_register_count > ARRAY_SIZE(current_shader)) {
         return false;
     }
+    command_hash = shadps4_d3d12_hash_bytes(
+        UINT64_C(1469598103934665603), commands,
+        (size_t)command_dwords * sizeof(*commands));
     uint32_t frame_index = d3d12->next_frame;
 
     d3d12->next_frame = (frame_index + 1) %
@@ -4299,12 +4329,26 @@ bool shadps4_d3d12_submit(ShadPS4D3D12State *d3d12,
     d3d12->submit_count++;
     d3d12->draw_count += draws;
     d3d12->dispatch_count += dispatches;
+    if (d3d12->submit_count == 2) {
+        g_autoptr(GString) opcodes = g_string_new(NULL);
+
+        for (uint32_t i = 0; i < ARRAY_SIZE(opcode_counts); i++) {
+            if (opcode_counts[i]) {
+                g_string_append_printf(opcodes, "%s%#x:%u",
+                                       opcodes->len ? "," : "",
+                                       i, opcode_counts[i]);
+            }
+        }
+        info_report("shadPS4 D3D12 initial draw submit opcodes=[%s]",
+                    opcodes->str);
+    }
     if (!(d3d12->submit_count & (d3d12->submit_count - 1))) {
         info_report("shadPS4 D3D12 submit: count=%" PRIu64
                     " dwords=%u draws=%" PRIu64 " emitted=%" PRIu64
-                    " dispatches=%" PRIu64 " total_draws=%" PRIu64,
+                    " dispatches=%" PRIu64 " total_draws=%" PRIu64
+                    " command_hash=%#" PRIx64,
                     d3d12->submit_count, command_dwords, draws, emitted_draws,
-                    dispatches, d3d12->draw_count);
+                    dispatches, d3d12->draw_count, command_hash);
     }
     bool report_no_draw = !draws && !dispatches;
 
@@ -4585,6 +4629,39 @@ bool shadps4_d3d12_publish_surface(ShadPS4D3D12State *d3d12,
     return true;
 }
 
+bool shadps4_d3d12_publish_latest_surface(ShadPS4D3D12State *d3d12,
+                                          uint32_t *index,
+                                          uint64_t frame_id)
+{
+    uint32_t candidate = SHADPS4_D3D12_VIDEO_SURFACES;
+    uint64_t last_use = 0;
+
+    if (!d3d12 || !d3d12->ready) {
+        return false;
+    }
+    for (uint32_t i = 0; i < SHADPS4_D3D12_VIDEO_SURFACES; i++) {
+        ShadPS4D3D12Surface *surface = &d3d12->surfaces[i];
+
+        if (!surface->video_out || !surface->texture ||
+            !surface->shared_handle || !surface->rendered) {
+            continue;
+        }
+        if (candidate == SHADPS4_D3D12_VIDEO_SURFACES ||
+            surface->last_use > last_use) {
+            candidate = i;
+            last_use = surface->last_use;
+        }
+    }
+    if (candidate == SHADPS4_D3D12_VIDEO_SURFACES ||
+        !shadps4_d3d12_publish_surface(d3d12, candidate, frame_id)) {
+        return false;
+    }
+    if (index) {
+        *index = candidate;
+    }
+    return true;
+}
+
 bool shadps4_d3d12_read_surface(ShadPS4D3D12State *d3d12,
                                 uint32_t index, uint8_t *pixels,
                                 uint32_t stride)
@@ -4654,6 +4731,14 @@ bool shadps4_d3d12_read_surface(ShadPS4D3D12State *d3d12,
     if (!shadps4_d3d12_finish(d3d12)) {
         return false;
     }
+    /*
+     * The copy sequence above always restores the texture to
+     * RENDER_TARGET.  Keep the software state in lockstep with that
+     * barrier: a VideoOut surface may have been published as COMMON before
+     * this CPU-readback path runs, and using COMMON as the StateBefore of a
+     * later draw barrier makes the D3D12 command stream invalid.
+     */
+    surface->state = D3D12_RESOURCE_STATE_RENDER_TARGET;
     read_range = (D3D12_RANGE) { 0, surface->readback_size };
     hr = ID3D12Resource_Map(surface->readback, 0, &read_range,
                             (void **)&mapped);

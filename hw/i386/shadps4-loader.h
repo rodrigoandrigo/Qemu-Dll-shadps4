@@ -13,7 +13,10 @@
 #define SHADPS4_IMAGE_VIRT_BASE 0x800000000ULL
 #define SHADPS4_IMAGE_PHYS_BASE 0x01000000ULL
 #define SHADPS4_MAX_SEGMENTS 16
-#define SHADPS4_MAX_MODULES 16
+/* Retail Unity titles commonly ship sce_module plus Media/Modules and
+ * Media/Plugins.  Fifteen auxiliary slots rejects valid installations before
+ * the linker can resolve their exports. */
+#define SHADPS4_MAX_MODULES 64
 
 typedef struct ShadPS4ImageSegment {
     uint64_t virtual_addr;

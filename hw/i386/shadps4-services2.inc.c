@@ -200,10 +200,10 @@ static int shadps4_hle_storage_copy_tree(const char *source,
             ret = -EINVAL;
             break;
         }
-        ret = stat.type == 4 ?
+        ret = (stat.type == 4 || stat.type == 2) ?
               shadps4_hle_storage_copy_tree(child_source, child_destination,
                                             depth + 1, total) :
-              stat.type == 8 ?
+              (stat.type == 8 || stat.type == 1) ?
               shadps4_hle_storage_copy_file(child_source, child_destination,
                                             total) : -EINVAL;
         if (ret < 0) {

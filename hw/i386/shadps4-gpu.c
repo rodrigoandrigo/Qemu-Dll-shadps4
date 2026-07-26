@@ -88,6 +88,20 @@ static void shadps4_gpu_report_reject(ShadPS4GPUState *gpu,
                 error && error->reason ? error->reason : "unspecified");
 }
 
+static void shadps4_gpu_report_queue_error(ShadPS4GPUState *gpu,
+                                           const char *operation,
+                                           uint32_t queue_id,
+                                           uint32_t offset)
+{
+    gpu->rejected_submit_count++;
+    if (!(gpu->rejected_submit_count &
+          (gpu->rejected_submit_count - 1))) {
+        warn_report("shadPS4 PM4 %s rejected: count=%" PRIu64
+                    " queue=%u offset=%u", operation,
+                    gpu->rejected_submit_count, queue_id, offset);
+    }
+}
+
 static bool shadps4_gpu_guest_rw(CPUState *cs, uint64_t addr, void *data,
                                  size_t size, bool write)
 {
@@ -298,6 +312,14 @@ static bool shadps4_gpu_execute_pm4_memory(CPUState *cs,
                                        (uint64_t)le32_to_cpu(payload[4]) << 32;
                 uint32_t size = le32_to_cpu(payload[5]) & 0x1fffff;
 
+                /*
+                 * Liverpool emits this sentinel while binding shader
+                 * programs.  It is not a guest-memory destination; shadPS4
+                 * drops the packet before handing DMA work to its rasterizer.
+                 */
+                if (le32_to_cpu(payload[3]) == 0x3022c) {
+                    break;
+                }
                 if ((dst_sel != 0 && dst_sel != 3) ||
                     size > SHADPS4_PM4_MAX_DMA_SIZE) {
                     return shadps4_gpu_parse_fail(error, offset, header,
@@ -762,6 +784,7 @@ int shadps4_gpu_map_queue(ShadPS4GPUState *gpu, CPUState *cs,
         (read_ptr_addr & 3) || gpu->queues[index].mapped ||
         !shadps4_gpu_guest_rw(cs, read_ptr_addr, &read_offset,
                               sizeof(read_offset), true)) {
+        shadps4_gpu_report_queue_error(gpu, "queue-map", index, 0);
         return -1;
     }
     gpu->queues[index].ring_addr = ring_addr;
@@ -793,10 +816,14 @@ bool shadps4_gpu_ding_dong(ShadPS4GPUState *gpu, CPUState *cs,
     uint32_t read_offset_le;
 
     if (!queue_id || queue_id > SHADPS4_GPU_MAX_QUEUES) {
+        shadps4_gpu_report_queue_error(gpu, "doorbell", queue_id,
+                                       next_offset);
         return false;
     }
     queue = &gpu->queues[queue_id - 1];
     if (!queue->mapped || next_offset >= queue->ring_dwords) {
+        shadps4_gpu_report_queue_error(gpu, "doorbell-range", queue_id,
+                                       next_offset);
         return false;
     }
     command_dwords = next_offset >= queue->read_offset ?
@@ -813,7 +840,8 @@ bool shadps4_gpu_ding_dong(ShadPS4GPUState *gpu, CPUState *cs,
              !shadps4_gpu_guest_rw(
                  cs, queue->ring_addr, commands + tail_dwords,
                  (command_dwords - tail_dwords) * sizeof(uint32_t), false))) {
-            gpu->rejected_submit_count++;
+            shadps4_gpu_report_queue_error(gpu, "ring-read", queue_id,
+                                           queue->read_offset);
             return false;
         }
         if (!shadps4_gpu_submit_commands(gpu, cs, commands, command_dwords,
@@ -825,8 +853,13 @@ bool shadps4_gpu_ding_dong(ShadPS4GPUState *gpu, CPUState *cs,
         queue->read_offset = next_offset;
     }
     read_offset_le = cpu_to_le32(queue->read_offset);
-    return shadps4_gpu_guest_rw(cs, queue->read_ptr_addr, &read_offset_le,
-                                sizeof(read_offset_le), true);
+    if (!shadps4_gpu_guest_rw(cs, queue->read_ptr_addr, &read_offset_le,
+                              sizeof(read_offset_le), true)) {
+        shadps4_gpu_report_queue_error(gpu, "read-pointer-write", queue_id,
+                                       queue->read_offset);
+        return false;
+    }
+    return true;
 }
 
 bool shadps4_gpu_flip(ShadPS4GPUState *gpu, CPUState *cs,
@@ -886,6 +919,8 @@ bool shadps4_gpu_flip(ShadPS4GPUState *gpu, CPUState *cs,
         gpu->frame_capacity = frame_size;
     }
 #ifdef CONFIG_WIN32
+    uint32_t presented_buffer;
+
     if (gpu->d3d12 && qemu_host_d3d12_video_callback_enabled() &&
         shadps4_d3d12_publish_surface(gpu->d3d12, flip->buffer_index,
                                       gpu->flip_count + 1)) {
@@ -900,6 +935,28 @@ bool shadps4_gpu_flip(ShadPS4GPUState *gpu, CPUState *cs,
                 QEMU_HOST_PIXEL_FORMAT_BGRA8888);
             qemu_host_emit_log(QEMU_HOST_LOG_INFO, message);
         }
+        gpu->video_backend_valid = true;
+        gpu->last_video_d3d12 = true;
+        return true;
+    }
+    /*
+     * Some titles rotate VideoOut buffers before their next command stream
+     * has rendered into that buffer.  Do not replace the last real D3D12
+     * frame with stale (usually black) guest backing memory in that window.
+     */
+    if (gpu->d3d12 && qemu_host_d3d12_video_callback_enabled() &&
+        shadps4_d3d12_publish_latest_surface(gpu->d3d12,
+                                             &presented_buffer,
+                                             gpu->flip_count + 1)) {
+        gpu->flip_count++;
+        message = g_strdup_printf(
+            "host video: flip=%" PRIu64 " buffer=%u gpu=%#" PRIx64
+            " presented_buffer=%u size=%ux%u format=%u "
+            "backend=d3d12-shared-fallback",
+            gpu->flip_count, flip->buffer_index, flip->pixels_addr,
+            presented_buffer, flip->width, flip->height,
+            QEMU_HOST_PIXEL_FORMAT_BGRA8888);
+        qemu_host_emit_log(QEMU_HOST_LOG_INFO, message);
         gpu->video_backend_valid = true;
         gpu->last_video_d3d12 = true;
         return true;
