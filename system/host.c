@@ -15,6 +15,7 @@
 #include "qapi/qapi-commands-ui.h"
 #include "system/replay.h"
 #include "system/runstate.h"
+#include "system/runstate-action.h"
 #include "system/system.h"
 #include "ui/console.h"
 #include "ui/input.h"
@@ -33,14 +34,8 @@ static bool host_last_fault_valid;
 static QemuHostFaultInfo host_last_fault;
 static QemuThread host_loop_thread;
 static GMutex host_callback_lock;
-static QemuHostLogCallback host_log_callback;
-static void *host_log_opaque;
-static QemuHostVideoCallback host_video_callback;
-static void *host_video_opaque;
 static QemuHostD3D12VideoCallback host_d3d12_video_callback;
 static void *host_d3d12_video_opaque;
-static QemuHostAudioCallback host_audio_callback;
-static void *host_audio_opaque;
 static QemuHostPadOutputCallback host_pad_output_callback;
 static void *host_pad_output_opaque;
 static QemuHostStorageCallbacks host_storage_callbacks;
@@ -276,61 +271,6 @@ static void host_dialog_requests_ensure(void)
     }
 }
 
-void qemu_host_register_log_callback(QemuHostLogCallback cb, void *opaque)
-{
-    g_mutex_lock(&host_callback_lock);
-    host_log_callback = cb;
-    host_log_opaque = opaque;
-    g_mutex_unlock(&host_callback_lock);
-}
-
-bool qemu_host_log_callback_enabled(void)
-{
-    bool enabled;
-
-    g_mutex_lock(&host_callback_lock);
-    enabled = host_log_callback != NULL;
-    g_mutex_unlock(&host_callback_lock);
-    return enabled;
-}
-
-void qemu_host_emit_log(QemuHostLogLevel level, const char *message)
-{
-    QemuHostLogCallback cb;
-    void *opaque;
-
-    g_mutex_lock(&host_callback_lock);
-    cb = host_log_callback;
-    opaque = host_log_opaque;
-    g_mutex_unlock(&host_callback_lock);
-    if (cb) {
-        cb(opaque, level, message);
-    }
-}
-
-void qemu_host_register_video_callback(QemuHostVideoCallback cb, void *opaque)
-{
-    g_mutex_lock(&host_callback_lock);
-    host_video_callback = cb;
-    host_video_opaque = opaque;
-    g_mutex_unlock(&host_callback_lock);
-}
-
-void qemu_host_emit_video_frame(const void *pixels, int width, int height,
-                                int stride, QemuHostPixelFormat format)
-{
-    QemuHostVideoCallback cb;
-    void *opaque;
-
-    g_mutex_lock(&host_callback_lock);
-    cb = host_video_callback;
-    opaque = host_video_opaque;
-    g_mutex_unlock(&host_callback_lock);
-    if (cb) {
-        cb(opaque, pixels, width, height, stride, format);
-    }
-}
-
 int qemu_host_register_d3d12_video_callback(
     QemuHostD3D12VideoCallback cb, void *opaque)
 {
@@ -373,30 +313,6 @@ void qemu_host_emit_d3d12_video_frame(
     g_mutex_unlock(&host_callback_lock);
     if (cb) {
         cb(opaque, frame);
-    }
-}
-
-void qemu_host_register_audio_callback(QemuHostAudioCallback cb, void *opaque)
-{
-    g_mutex_lock(&host_callback_lock);
-    host_audio_callback = cb;
-    host_audio_opaque = opaque;
-    g_mutex_unlock(&host_callback_lock);
-}
-
-void qemu_host_emit_audio_frame(const void *samples, size_t size,
-                                int sample_rate, int channels,
-                                QemuHostAudioFormat format)
-{
-    QemuHostAudioCallback cb;
-    void *opaque;
-
-    g_mutex_lock(&host_callback_lock);
-    cb = host_audio_callback;
-    opaque = host_audio_opaque;
-    g_mutex_unlock(&host_callback_lock);
-    if (cb) {
-        cb(opaque, samples, size, sample_rate, channels, format);
     }
 }
 
@@ -1779,12 +1695,75 @@ int qemu_host_main_loop_step(bool nonblocking, int *exit_status)
     return 0;
 }
 
+void qemu_host_wake_main_loop(void)
+{
+    qemu_notify_event();
+}
+
+int qemu_host_pause(void)
+{
+    int result;
+
+    if (!host_is_ready()) {
+        return -EINVAL;
+    }
+
+    replay_mutex_lock();
+    bql_lock();
+    if (runstate_check(RUN_STATE_PAUSED)) {
+        result = 0;
+    } else if (runstate_is_live(runstate_get())) {
+        result = vm_stop(RUN_STATE_PAUSED);
+    } else {
+        result = -EBUSY;
+    }
+    bql_unlock();
+    replay_mutex_unlock();
+    return result;
+}
+
+int qemu_host_resume(void)
+{
+    int result;
+
+    if (!host_is_ready()) {
+        return -EINVAL;
+    }
+
+    replay_mutex_lock();
+    bql_lock();
+    if (runstate_check(RUN_STATE_RUNNING)) {
+        result = 0;
+    } else if (runstate_check(RUN_STATE_PAUSED)) {
+        vm_start();
+        result = runstate_check(RUN_STATE_RUNNING) ? 0 : -EIO;
+    } else {
+        result = -EBUSY;
+    }
+    bql_unlock();
+    replay_mutex_unlock();
+    return result;
+}
+
 int qemu_host_request_shutdown(void)
 {
     if (!host_is_ready()) {
         return -EINVAL;
     }
 
+    /* Match the UI's graceful Shutdown action: deliver the power button. */
+    qemu_system_powerdown_request();
+    return 0;
+}
+
+int qemu_host_request_stop(void)
+{
+    if (!host_is_ready()) {
+        return -EINVAL;
+    }
+
+    /* Stop is an application lifecycle command, not a guest power action. */
+    shutdown_action = SHUTDOWN_ACTION_POWEROFF;
     qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
     qemu_notify_event();
     return 0;
@@ -1894,14 +1873,8 @@ int qemu_host_cleanup(void)
     g_mutex_lock(&host_callback_lock);
     host_input_sink = (QemuHostInputSink) { 0 };
     host_input_sink_opaque = NULL;
-    host_log_callback = NULL;
-    host_log_opaque = NULL;
-    host_video_callback = NULL;
-    host_video_opaque = NULL;
     host_d3d12_video_callback = NULL;
     host_d3d12_video_opaque = NULL;
-    host_audio_callback = NULL;
-    host_audio_opaque = NULL;
     host_pad_output_callback = NULL;
     host_pad_output_opaque = NULL;
     host_storage_callbacks = (QemuHostStorageCallbacks) { 0 };
@@ -1923,6 +1896,11 @@ int qemu_host_cleanup(void)
     g_clear_pointer(&host_dialog_requests, g_hash_table_unref);
     g_clear_pointer(&host_brokered_reported_misses, g_hash_table_unref);
     g_mutex_unlock(&host_callback_lock);
+
+    qemu_host_register_log_callback(NULL, NULL);
+    qemu_host_register_video_callback(NULL, NULL);
+    qemu_host_register_video_update_callback(NULL, NULL);
+    qemu_host_register_audio_callback(NULL, NULL);
 
     return 0;
 }

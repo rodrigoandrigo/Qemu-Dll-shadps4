@@ -16,65 +16,6 @@ i386_ss.add(when: 'CONFIG_AMD_IOMMU', if_true: files('amd_iommu.c'),
 i386_ss.add(when: 'CONFIG_I440FX', if_true: files('pc_piix.c'))
 i386_ss.add(when: 'CONFIG_ISAPC', if_true: files('isapc.c'))
 i386_ss.add(when: 'CONFIG_MICROVM', if_true: files('x86-common.c', 'microvm.c', 'acpi-microvm.c', 'microvm-dt.c'))
-i386_ss.add(when: 'CONFIG_SHADPS4_MACHINE',
-            if_true: files('shadps4.c', 'shadps4-loader.c',
-                           'shadps4-hle.c', 'shadps4-gpu.c',
-                           'shadps4-io.c'))
-if host_os == 'windows'
-  shadps4_d3d12 = cc.find_library(is_uwp ? 'WindowsApp' : 'd3d12',
-                                  required: true)
-  i386_ss.add(when: 'CONFIG_SHADPS4_MACHINE',
-              if_true: files('shadps4-gpu-d3d12.c',
-                             'shadps4-gpu-dxil.c'))
-  i386_ss.add(when: 'CONFIG_SHADPS4_MACHINE', if_true: shadps4_d3d12)
-  shadps4_dxil_dir = meson.project_source_root() / 'build-mesa-dxil' / \
-                     'src' / 'microsoft' / 'spirv_to_dxil'
-  shadps4_dxil = cc.find_library('spirv_to_dxil',
-                                 dirs: shadps4_dxil_dir,
-                                 static: false,
-                                 required: false)
-    if shadps4_dxil.found()
-      shadps4_dxil_runtime = shadps4_dxil_dir / 'libspirv_to_dxil.dll'
-      install_data(shadps4_dxil_runtime,
-                   install_dir: get_option('bindir'))
-      shadps4_validator_runtime = get_option('shadps4_dxil_runtime')
-      if shadps4_validator_runtime == '' and host_machine.cpu_family() == 'x86_64'
-        shadps4_sdk_dxil = 'C:/Program Files (x86)/Windows Kits/10/Redist/D3D/x64/dxil.dll'
-        if fs.exists(shadps4_sdk_dxil)
-          shadps4_validator_runtime = shadps4_sdk_dxil
-        endif
-      endif
-      if shadps4_validator_runtime != '' and fs.exists(shadps4_validator_runtime)
-        install_data(shadps4_validator_runtime,
-                     install_dir: get_option('bindir'))
-      else
-        warning('DXIL.dll was not found; set -Dshadps4_dxil_runtime=PATH for D3D12 shader validation')
-      endif
-      shadps4_dxil_enabled = declare_dependency(
-        dependencies: shadps4_dxil,
-        compile_args: ['-DCONFIG_SHADPS4_SPIRV_TO_DXIL'])
-    i386_ss.add(when: 'CONFIG_SHADPS4_MACHINE',
-                if_true: shadps4_dxil_enabled)
-  endif
-  shadps4_gcn_dir = meson.project_source_root() / \
-                     'build-shadps4-gcn-bridge-msys'
-  shadps4_gcn = cc.find_library('shadps4_gcn_bridge',
-                                dirs: shadps4_gcn_dir,
-                                static: false,
-                                required: false)
-  if shadps4_gcn.found()
-    install_data(shadps4_gcn_dir / 'libshadps4_gcn_bridge.dll',
-                 install_dir: get_option('bindir'))
-    shadps4_gcn_enabled = declare_dependency(
-      dependencies: shadps4_gcn,
-      include_directories: include_directories(
-        '../../subprojects/shadps4-gcn-bridge'),
-      compile_args: ['-DCONFIG_SHADPS4_GCN_BRIDGE'])
-    i386_ss.add(when: 'CONFIG_SHADPS4_MACHINE',
-                if_true: shadps4_gcn_enabled)
-  endif
-endif
-i386_ss.add(when: 'CONFIG_SHADPS4_MACHINE', if_true: zlib)
 i386_ss.add(when: 'CONFIG_NITRO_ENCLAVE', if_true: files('nitro_enclave.c'))
 i386_ss.add(when: 'CONFIG_Q35', if_true: files('pc_q35.c'))
 i386_ss.add(when: 'CONFIG_VMMOUSE', if_true: files('vmmouse.c'))

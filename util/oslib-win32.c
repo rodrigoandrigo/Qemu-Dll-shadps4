@@ -58,7 +58,12 @@ void *qemu_anon_ram_alloc(size_t size, uint64_t *align, bool shared,
         return NULL;
     }
 
+#if defined(CONFIG_UWP) && defined(CONFIG_UWP_FROMAPP_VIRTUAL_MEMORY)
+    ptr = VirtualAllocFromApp(NULL, size, MEM_RESERVE | MEM_COMMIT,
+                              PAGE_READWRITE);
+#else
     ptr = VirtualAlloc(NULL, size, MEM_COMMIT, PAGE_READWRITE);
+#endif
     trace_qemu_anon_ram_alloc(size, ptr);
 
     if (ptr && align) {
@@ -872,14 +877,23 @@ void *qemu_win32_map_alloc(size_t size, HANDLE *h, Error **errp)
 
     trace_win32_map_alloc(size);
 
+#ifdef CONFIG_UWP
+    *h = CreateFileMappingFromApp(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+                                  size, NULL);
+#else
     *h = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0,
-                          size, NULL);
+                           size, NULL);
+#endif
     if (*h == NULL) {
         error_setg_win32(errp, GetLastError(), "Failed to CreateFileMapping");
         return NULL;
     }
 
+#ifdef CONFIG_UWP
+    bits = MapViewOfFileFromApp(*h, FILE_MAP_ALL_ACCESS, 0, size);
+#else
     bits = MapViewOfFile(*h, FILE_MAP_ALL_ACCESS, 0, 0, size);
+#endif
     if (bits == NULL) {
         error_setg_win32(errp, GetLastError(), "Failed to MapViewOfFile");
         CloseHandle(*h);

@@ -34,7 +34,7 @@ static QemuHostPixelFormat host_display_format(pixman_format_code_t format)
     }
 }
 
-static void host_display_emit(HostDisplay *hdpy)
+static void host_display_emit(HostDisplay *hdpy, int x, int y, int w, int h)
 {
     DisplaySurface *surface = hdpy->surface;
     QemuHostPixelFormat format;
@@ -48,11 +48,11 @@ static void host_display_emit(HostDisplay *hdpy)
         return;
     }
 
-    qemu_host_emit_video_frame(surface_data(surface),
-                               surface_width(surface),
-                               surface_height(surface),
-                               surface_stride(surface),
-                               format);
+    qemu_host_emit_video_update(surface_data(surface),
+                                surface_width(surface),
+                                surface_height(surface),
+                                surface_stride(surface),
+                                format, x, y, w, h);
 }
 
 static void host_display_refresh(DisplayChangeListener *dcl)
@@ -67,7 +67,7 @@ static void host_display_update(DisplayChangeListener *dcl,
 {
     HostDisplay *hdpy = container_of(dcl, HostDisplay, dcl);
 
-    host_display_emit(hdpy);
+    host_display_emit(hdpy, x, y, w, h);
 }
 
 static void host_display_switch(DisplayChangeListener *dcl,
@@ -76,7 +76,11 @@ static void host_display_switch(DisplayChangeListener *dcl,
     HostDisplay *hdpy = container_of(dcl, HostDisplay, dcl);
 
     hdpy->surface = new_surface;
-    host_display_emit(hdpy);
+    if (new_surface) {
+        host_display_emit(hdpy, 0, 0,
+                          surface_width(new_surface),
+                          surface_height(new_surface));
+    }
 }
 
 static bool host_display_check_format(DisplayChangeListener *dcl,

@@ -849,6 +849,8 @@ midl = not_found
 widl = not_found
 pathcch = not_found
 synchronization = not_found
+onecore = not_found
+have_uwp_fromapp_virtual_memory = false
 host_dsosuf = '.so'
 if host_os == 'windows'
   midl = find_program('midl', required: false)
@@ -858,7 +860,20 @@ if host_os == 'windows'
   pathcch = cc.find_library('pathcch', required: true)
   synchronization = cc.find_library('synchronization', required: true)
   socket = cc.find_library('ws2_32', required: true)
-  if not is_uwp
+  if is_uwp
+    # Windows SDK UWP exposes these APIs through OneCore.lib.  The legacy
+    # Durango XDK uses its TV_APP VirtualAlloc/VirtualProtect API instead.
+    onecore = cc.find_library('onecore', required: false)
+    if onecore.found()
+      have_uwp_fromapp_virtual_memory = cc.has_function(
+        'VirtualProtectFromApp',
+        prefix: '''
+          #define _WIN32_WINNT 0x0A00
+          #include <windows.h>
+        ''',
+        dependencies: onecore)
+    endif
+  else
     winmm = cc.find_library('winmm', required: true)
   endif
 
@@ -904,7 +919,10 @@ if get_option('mshv').allowed() and host_os == 'linux'
   accelerators += 'CONFIG_MSHV'
 endif
 
-if get_option('whpx').allowed() and host_os == 'windows'
+if get_option('whpx') \
+     .require(not is_uwp,
+              error_message: 'WHPX is unavailable in the TCG-only UWP host') \
+     .allowed() and host_os == 'windows'
   if cpu == 'i386'
     if get_option('whpx').enabled()
      error('WHPX requires 64-bit host')
@@ -1452,7 +1470,7 @@ if not get_option('blkio').auto() or have_block
                      required: get_option('blkio'))
 endif
 curl = not_found
-if not get_option('curl').auto() or have_block
+if not get_option('curl').auto() or (have_block and not is_uwp)
   curl = dependency('libcurl', version: '>=7.29.0',
                     method: 'pkg-config',
                     required: get_option('curl'))
@@ -1852,7 +1870,7 @@ if not get_option('coreaudio').auto() or (host_os == 'darwin' and have_system)
 endif
 
 opengl = not_found
-if not get_option('opengl').auto() or have_system or have_vhost_user_gpu
+if not get_option('opengl').auto() or ((have_system or have_vhost_user_gpu) and not is_uwp)
   epoxy = dependency('epoxy', method: 'pkg-config',
                       required: get_option('opengl'))
   if cc.has_header('epoxy/egl.h', dependencies: epoxy)
@@ -2031,6 +2049,8 @@ jpeg = not_found
 sasl = not_found
 if get_option('vnc') \
              .disable_auto_if(not have_system) \
+             .require(not is_uwp,
+                      error_message: 'VNC is disabled for the local-only UWP host') \
              .require(pixman.found(),
                       error_message: 'cannot enable VNC if pixman is not available') \
              .allowed()
@@ -2396,6 +2416,7 @@ have_host_block_device = (host_os != 'darwin' or
     cc.has_header('IOKit/storage/IOMedia.h'))
 
 dbus_display = get_option('dbus_display') \
+  .disable_auto_if(is_uwp) \
   .require(gio.version().version_compare('>=2.64'),
            error_message: '-display dbus requires glib>=2.64') \
   .require(gdbus_codegen.found(),
@@ -2518,6 +2539,8 @@ config_host_data.set('CONFIG_LINUX', host_os == 'linux')
 config_host_data.set('CONFIG_POSIX', host_os != 'windows')
 config_host_data.set('CONFIG_WIN32', host_os == 'windows')
 config_host_data.set('CONFIG_UWP', is_uwp)
+config_host_data.set('CONFIG_UWP_FROMAPP_VIRTUAL_MEMORY',
+                     have_uwp_fromapp_virtual_memory)
 config_host_data.set('CONFIG_LZO', lzo.found())
 config_host_data.set('CONFIG_MPATH', mpathpersist.found())
 config_host_data.set('CONFIG_BLKIO', blkio.found())
@@ -3835,17 +3858,6 @@ else
   subdir('hw/core')
 endif
 
-if is_variable('shadps4_dxil_runtime')
-  configure_file(input: shadps4_dxil_runtime,
-                 output: 'libspirv_to_dxil.dll',
-                 copy: true)
-endif
-if is_variable('shadps4_validator_runtime') and shadps4_validator_runtime != ''
-  configure_file(input: shadps4_validator_runtime,
-                 output: 'DXIL.dll',
-                 copy: true)
-endif
-
 if enable_modules
   libmodulecommon = static_library('module-common', files('module-common.c') + genh, pic: true, c_args: '-DBUILD_DSO')
   modulecommon = declare_dependency(objects: libmodulecommon.extract_all_objects(recursive: false), compile_args: '-DBUILD_DSO')
@@ -3875,7 +3887,7 @@ libqemuutil = static_library('qemuutil',
                              dependencies: [util_ss.dependencies(), libm, threads, glib, socket, malloc, rt, pixman, opengl])
 qemuutil = declare_dependency(link_with: libqemuutil,
                               sources: genh + version_res,
-                              dependencies: [event_loop_base])
+                              dependencies: [event_loop_base, onecore])
 
 if have_system or have_user
   decodetree = generator(find_program('scripts/decodetree.py'),

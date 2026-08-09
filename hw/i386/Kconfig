@@ -134,11 +134,6 @@ config MICROVM
     select USB_XHCI_SYSBUS
     select I8254
 
-config SHADPS4_MACHINE
-    bool
-    depends on I386
-    select APIC
-
 config NITRO_ENCLAVE
     default y
     depends on I386 && FDT # for MICROVM

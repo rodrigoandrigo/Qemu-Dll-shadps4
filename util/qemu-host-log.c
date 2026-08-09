@@ -14,6 +14,8 @@ static QemuHostLogCallback host_log_cb;
 static void *host_log_opaque;
 static QemuHostVideoCallback host_video_cb;
 static void *host_video_opaque;
+static QemuHostVideoUpdateCallback host_video_update_cb;
+static void *host_video_update_opaque;
 static QemuHostAudioCallback host_audio_cb;
 static void *host_audio_opaque;
 
@@ -58,21 +60,51 @@ void qemu_host_register_video_callback(QemuHostVideoCallback cb, void *opaque)
     g_mutex_unlock(&host_callback_lock);
 }
 
+void qemu_host_register_video_update_callback(
+    QemuHostVideoUpdateCallback cb, void *opaque)
+{
+    g_mutex_lock(&host_callback_lock);
+    host_video_update_cb = cb;
+    host_video_update_opaque = opaque;
+    g_mutex_unlock(&host_callback_lock);
+}
+
 void qemu_host_emit_video_frame(const void *pixels,
                                 int width,
                                 int height,
                                 int stride,
                                 QemuHostPixelFormat format)
 {
+    qemu_host_emit_video_update(pixels, width, height, stride, format,
+                                0, 0, width, height);
+}
+
+void qemu_host_emit_video_update(const void *pixels,
+                                 int width,
+                                 int height,
+                                 int stride,
+                                 QemuHostPixelFormat format,
+                                 int x,
+                                 int y,
+                                 int update_width,
+                                 int update_height)
+{
     QemuHostVideoCallback cb;
     void *opaque;
+    QemuHostVideoUpdateCallback update_cb;
+    void *update_opaque;
 
     g_mutex_lock(&host_callback_lock);
     cb = host_video_cb;
     opaque = host_video_opaque;
+    update_cb = host_video_update_cb;
+    update_opaque = host_video_update_opaque;
     g_mutex_unlock(&host_callback_lock);
 
-    if (cb) {
+    if (update_cb) {
+        update_cb(update_opaque, pixels, width, height, stride, format,
+                  x, y, update_width, update_height);
+    } else if (cb) {
         cb(opaque, pixels, width, height, stride, format);
     }
 }

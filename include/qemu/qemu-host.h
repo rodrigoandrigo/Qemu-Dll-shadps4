@@ -37,7 +37,7 @@ typedef enum QemuHostLogLevel {
 } QemuHostLogLevel;
 
 #define QEMU_HOST_API_VERSION_MAJOR 1U
-#define QEMU_HOST_API_VERSION_MINOR 1U
+#define QEMU_HOST_API_VERSION_MINOR 3U
 #define QEMU_HOST_API_VERSION \
     ((QEMU_HOST_API_VERSION_MAJOR << 16) | QEMU_HOST_API_VERSION_MINOR)
 
@@ -486,6 +486,16 @@ typedef void (*QemuHostVideoCallback)(void *opaque,
                                       int height,
                                       int stride,
                                       QemuHostPixelFormat format);
+typedef void (*QemuHostVideoUpdateCallback)(void *opaque,
+                                            const void *pixels,
+                                            int width,
+                                            int height,
+                                            int stride,
+                                            QemuHostPixelFormat format,
+                                            int x,
+                                            int y,
+                                            int update_width,
+                                            int update_height);
 
 #define QEMU_HOST_D3D12_VIDEO_FRAME_VERSION 1
 
@@ -532,7 +542,13 @@ QEMU_HOST_EXPORT uint32_t qemu_host_get_api_version(void);
 QEMU_HOST_EXPORT int qemu_host_start(void);
 QEMU_HOST_EXPORT int qemu_host_main_loop_step(bool nonblocking,
                                               int *exit_status);
+/* Thread-safe: wake a blocking qemu_host_main_loop_step(false, ...). */
+QEMU_HOST_EXPORT void qemu_host_wake_main_loop(void);
+QEMU_HOST_EXPORT int qemu_host_pause(void);
+QEMU_HOST_EXPORT int qemu_host_resume(void);
 QEMU_HOST_EXPORT int qemu_host_request_shutdown(void);
+/* Force the embedded loop to exit even when -no-shutdown is configured. */
+QEMU_HOST_EXPORT int qemu_host_request_stop(void);
 QEMU_HOST_EXPORT int qemu_host_reset(void);
 QEMU_HOST_EXPORT int qemu_host_join(int *exit_status);
 QEMU_HOST_EXPORT int qemu_host_cleanup(void);
@@ -550,11 +566,17 @@ QEMU_HOST_EXPORT void qemu_host_emit_log(QemuHostLogLevel level,
 
 QEMU_HOST_EXPORT void qemu_host_register_video_callback(
     QemuHostVideoCallback cb, void *opaque);
+QEMU_HOST_EXPORT void qemu_host_register_video_update_callback(
+    QemuHostVideoUpdateCallback cb, void *opaque);
 QEMU_HOST_EXPORT void qemu_host_emit_video_frame(const void *pixels,
                                                  int width,
                                                  int height,
                                                  int stride,
                                                  QemuHostPixelFormat format);
+QEMU_HOST_EXPORT void qemu_host_emit_video_update(
+    const void *pixels, int width, int height, int stride,
+    QemuHostPixelFormat format, int x, int y,
+    int update_width, int update_height);
 QEMU_HOST_EXPORT int qemu_host_register_d3d12_video_callback(
     QemuHostD3D12VideoCallback cb, void *opaque);
 QEMU_HOST_EXPORT bool qemu_host_d3d12_video_callback_enabled(void);
