@@ -850,6 +850,8 @@ widl = not_found
 pathcch = not_found
 synchronization = not_found
 onecore = not_found
+bcrypt = not_found
+iconv_uwp = not_found
 have_uwp_fromapp_virtual_memory = false
 host_dsosuf = '.so'
 if host_os == 'windows'
@@ -860,6 +862,10 @@ if host_os == 'windows'
   pathcch = cc.find_library('pathcch', required: true)
   synchronization = cc.find_library('synchronization', required: true)
   socket = cc.find_library('ws2_32', required: true)
+  bcrypt = cc.find_library('bcrypt', required: true)
+  if is_uwp
+    iconv_uwp = cc.find_library('iconv', required: false)
+  endif
   if is_uwp
     # Windows SDK UWP exposes these APIs through OneCore.lib.  The legacy
     # Durango XDK uses its TV_APP VirtualAlloc/VirtualProtect API instead.
@@ -3880,6 +3886,12 @@ event_loop_base = declare_dependency(objects: event_loop_base.extract_all_object
 stub_ss = stub_ss.apply({})
 
 util_ss.add_all(trace_ss)
+if bcrypt.found()
+  util_ss.add(bcrypt)
+endif
+if iconv_uwp.found()
+  util_ss.add(iconv_uwp)
+endif
 util_ss = util_ss.apply({})
 libqemuutil = static_library('qemuutil',
                              build_by_default: false,
