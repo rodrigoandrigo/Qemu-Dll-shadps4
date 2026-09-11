@@ -86,6 +86,7 @@ struct QemuCxbxCpu {
     bool destroyed;
     bool registers_valid;
     bool thread_state_valid;
+    uint32_t startup_trace_turns;
 };
 
 typedef struct CxbxRunRequest {
@@ -102,6 +103,8 @@ static bool cxbx_global_lock_ready;
 static bool cxbx_qemu_ready;
 static X86CPU *cxbx_shared_x86;
 static uint32_t cxbx_shared_x86_users;
+static CxbxCpuThreadState cxbx_initial_thread_state;
+static bool cxbx_initial_thread_state_valid;
 extern bool tcg_cxbx_intercept_guest_exceptions;
 static bool cxbx_gateway_stubs_ready;
 static MemoryRegion cxbx_gateway_region;
@@ -142,7 +145,10 @@ static void cxbx_remove_mapping_locked(CxbxMemoryMapping *mapping)
 }
 
 /* Deterministic instruction budget for one logical Xbox thread turn. */
-#define CXBX_TCG_INSN_BUDGET INT64_C(32768)
+/* Keep diagnostic turns short enough to expose the instruction window that
+ * first crosses into unmapped low memory. Restore a larger budget after the
+ * remaining startup fault has been localized. */
+#define CXBX_TCG_INSN_BUDGET INT64_C(512)
 #define CXBX_GATEWAY_REGION_SIZE UINT32_C(0x40000)
 
 static void cxbx_write_gateway_trap(uint32_t address)
@@ -498,6 +504,13 @@ int QEMU_CXBX_CALL qemu_cxbx_cpu_create(const QemuCxbxCpuConfig *config,
         g_free(cpu);
         return QEMU_CXBX_CPU_HOST_ERROR;
     }
+	if (!cxbx_initial_thread_state_valid) {
+		CPUState *cs = CPU(cxbx_shared_x86);
+		cxbx_save_thread_state(cs, &cxbx_shared_x86->env,
+		                       &cxbx_initial_thread_state);
+		cxbx_initial_thread_state.exception_index = -1;
+		cxbx_initial_thread_state_valid = true;
+	}
     cpu->x86 = cxbx_shared_x86;
     cxbx_shared_x86_users++;
     qemu_mutex_unlock(&cxbx_global_lock);
@@ -678,6 +691,9 @@ int QEMU_CXBX_CALL qemu_cxbx_cpu_set_registers(QemuCxbxCpu *cpu,
     qemu_mutex_lock(&cpu->lock);
     cpu->registers = *r;
     cpu->registers_valid = true;
+    if (!cpu->thread_state_valid) {
+        cpu->startup_trace_turns = 32;
+    }
     qemu_mutex_unlock(&cpu->lock);
     return QEMU_CXBX_CPU_OK;
 }
@@ -778,9 +794,19 @@ static int cxbx_cpu_execute_slice(QemuCxbxCpu *cpu,
         cxbx_overlay_public_registers(env, &cpu->registers,
                                       &cpu->snapshot_registers);
     } else {
-        cs->exception_index = -1;
+		/* Every logical Xbox thread starts from the realized Pentium III state.
+		 * Without this restore, its first slice inherits lazy flags, FPU/SSE,
+		 * descriptor and exception state left in the shared physical CPU by the
+		 * previously scheduled thread. */
+		cxbx_restore_thread_state(cs, env, &cxbx_initial_thread_state);
         cxbx_copy_to_env(env, &cpu->registers);
     }
+    /* The embedding API maps Xbox linear addresses directly into QEMU's
+     * system address space.  CR0 is shared by the single physical CPUState,
+     * but is not part of a logical thread's public register block.  Never let
+     * paging state inherited from another slice translate KSEG0 accesses
+     * (for example 0x80010000) onto the low XBE image. */
+    cpu_x86_update_cr0(env, (env->cr[0] | CR0_PE_MASK) & ~CR0_PG_MASK);
     cxbx_current = cpu;
     current_cpu = cs;
     cs->halted = false;
@@ -801,11 +827,15 @@ static int cxbx_cpu_execute_slice(QemuCxbxCpu *cpu,
      * atomic step; EXCP_INTERRUPT only crosses the ABI at a Cxbx gateway.
      */
     for (;;) {
-        icount_prepare_for_run(cs, CXBX_TCG_INSN_BUDGET);
+        icount_prepare_for_run(cs, cpu->startup_trace_turns ?
+                              INT64_C(1) : CXBX_TCG_INSN_BUDGET);
         exec_result = tcg_cpu_exec(cs);
         timeslice_expired = exec_result == EXCP_INTERRUPT &&
             cs->neg.icount_decr.u16.low == 0 && cs->icount_extra == 0;
         icount_process_data(cs);
+        if (cpu->startup_trace_turns) {
+            --cpu->startup_trace_turns;
+        }
 
         if (cpu->stop_requested) {
             break;
@@ -840,6 +870,15 @@ static int cxbx_cpu_execute_slice(QemuCxbxCpu *cpu,
         result->reason = QEMU_CXBX_CPU_RUN_HOST_REQUEST;
     } else if (cxbx_decode_gateway((uint32_t)env->eip, &kind, &id)) {
         result->reason = QEMU_CXBX_CPU_RUN_STOPPED;
+    } else if ((uint32_t)env->eip < UINT32_C(0x10000)) {
+        /* The Xbox user image starts at 0x10000. The catch-all MMIO region
+         * returns zero for unmapped reads, so executing an invalid low target
+         * would otherwise look like an endless stream of ADD [EAX],AL and
+         * eventually wrap into the XBE header. Stop at the actual bad target. */
+        result->reason = QEMU_CXBX_CPU_RUN_GUEST_EXCEPTION;
+        result->exception_vector = EXCP0E_PAGE;
+        result->error_code = 0;
+        result->fault_address = (uint32_t)env->eip;
     } else if (exec_result == EXCP_INTERRUPT && timeslice_expired) {
         result->reason = QEMU_CXBX_CPU_RUN_TIMESLICE;
     } else if (exec_result == EXCP_INTERRUPT) {
@@ -853,7 +892,11 @@ static int cxbx_cpu_execute_slice(QemuCxbxCpu *cpu,
         result->fault_address = (uint32_t)env->eip;
     } else {
         result->reason = QEMU_CXBX_CPU_RUN_GUEST_EXCEPTION;
-        result->exception_vector = cs->exception_index;
+        /* tcg_cpu_exec() returns the architectural x86 exception vector.
+         * exception_index is cleared before the logical context is saved so
+         * it cannot leak into the next thread; reporting it here therefore
+         * produced UINT32_MAX instead of useful values such as #UD (6). */
+        result->exception_vector = exec_result;
         result->error_code = exec_result;
         result->fault_address = env->cr[2];
     }
