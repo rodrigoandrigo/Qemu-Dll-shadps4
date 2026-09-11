@@ -428,7 +428,38 @@ int QEMU_CXBX_CALL qemu_cxbx_cpu_run(QemuCxbxCpu *cpu,
     cs->halted = false;
     cpu_reset_interrupt(cs, CPU_INTERRUPT_EXITTB);
     qatomic_store_release(&cs->exit_request, false);
-    exec_result = tcg_cpu_exec(cs);
+    /*
+     * tcg_cpu_exec() is the low-level executor, not the complete QEMU vCPU
+     * loop.  In particular EXCP_INTERRUPT is only a request to leave the
+     * current translated block and EXCP_ATOMIC asks the caller to execute one
+     * instruction through the serial atomic path.  Returning either as a
+     * persistent "stopped" vCPU leaves EIP unchanged and makes the embedding
+     * host spin forever.
+     *
+     * Keep those internal transitions inside the backend.  We return at an
+     * interrupt boundary only when the new EIP is one of the synthetic Cxbx
+     * gateways, so the host can dispatch the HLE call on the next run().
+     */
+    for (;;) {
+        exec_result = tcg_cpu_exec(cs);
+
+        if (cpu->stop_requested) {
+            break;
+        }
+        if (exec_result == EXCP_ATOMIC) {
+            cpu_exec_step_atomic(cs);
+            continue;
+        }
+        if (exec_result == EXCP_INTERRUPT) {
+            if (cxbx_decode_gateway((uint32_t)env->eip, &kind, &id)) {
+                break;
+            }
+            cpu_reset_interrupt(cs, CPU_INTERRUPT_EXITTB);
+            qatomic_store_release(&cs->exit_request, false);
+            continue;
+        }
+        break;
+    }
     current_cpu = NULL;
     cxbx_current = NULL;
 
@@ -439,10 +470,14 @@ int QEMU_CXBX_CALL qemu_cxbx_cpu_run(QemuCxbxCpu *cpu,
     } else if (exec_result == EXCP_HLT) {
         result->reason = QEMU_CXBX_CPU_RUN_HALT;
     } else if (exec_result == EXCP_DEBUG) {
-        result->reason = QEMU_CXBX_CPU_RUN_STOPPED;
+        result->reason = QEMU_CXBX_CPU_RUN_GUEST_EXCEPTION;
+        result->exception_vector = EXCP01_DB;
+        result->error_code = exec_result;
+        result->fault_address = (uint32_t)env->eip;
     } else {
         result->reason = QEMU_CXBX_CPU_RUN_GUEST_EXCEPTION;
         result->exception_vector = cs->exception_index;
+        result->error_code = exec_result;
         result->fault_address = env->cr[2];
     }
     qemu_mutex_unlock(&cpu->lock);
